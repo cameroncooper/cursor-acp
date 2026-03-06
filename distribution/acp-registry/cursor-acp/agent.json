@@ -1,35 +1,35 @@
 {
   "id": "cursor-acp",
   "name": "Cursor CLI",
-  "version": "0.2.0",
-  "description": "ACP proxy for Cursor CLI — adds Plan UI from Cursor's todo list",
+  "version": "1.0.0",
+  "description": "ACP proxy for Cursor CLI — adds session persistence, Plan UI, and edit tracking",
   "repository": "https://github.com/cameroncooper/cursor-acp",
   "authors": ["Cursor ACP Contributors"],
   "license": "MIT",
   "distribution": {
     "binary": {
       "darwin-aarch64": {
-        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-aarch64-apple-darwin.tar.gz",
+        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v1.0.0/cursor-acp-1.0.0-aarch64-apple-darwin.tar.gz",
         "cmd": "./cursor-acp"
       },
       "darwin-x86_64": {
-        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-x86_64-apple-darwin.tar.gz",
+        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v1.0.0/cursor-acp-1.0.0-x86_64-apple-darwin.tar.gz",
         "cmd": "./cursor-acp"
       },
       "linux-aarch64": {
-        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-aarch64-unknown-linux-musl.tar.gz",
+        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v1.0.0/cursor-acp-1.0.0-aarch64-unknown-linux-musl.tar.gz",
         "cmd": "./cursor-acp"
       },
       "linux-x86_64": {
-        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-x86_64-unknown-linux-musl.tar.gz",
+        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v1.0.0/cursor-acp-1.0.0-x86_64-unknown-linux-musl.tar.gz",
         "cmd": "./cursor-acp"
       },
       "windows-aarch64": {
-        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-aarch64-pc-windows-msvc.zip",
+        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v1.0.0/cursor-acp-1.0.0-aarch64-pc-windows-msvc.zip",
         "cmd": "cursor-acp.exe"
       },
       "windows-x86_64": {
-        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-x86_64-pc-windows-msvc.zip",
+        "archive": "https://github.com/cameroncooper/cursor-acp/releases/download/v1.0.0/cursor-acp-1.0.0-x86_64-pc-windows-msvc.zip",
         "cmd": "cursor-acp.exe"
       }
     }
