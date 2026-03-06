@@ -85,7 +85,8 @@ impl SessionStore {
                 .is_some_and(|s| s.title.is_none())
         };
         if needs_update {
-            self.update_title(session_id, &format_session_title(title)).await;
+            self.update_title(session_id, &format_session_title(title))
+                .await;
         }
     }
 
@@ -145,7 +146,10 @@ impl SessionStore {
     }
 
     pub async fn load_history(&self, session_id: &str) -> Vec<Value> {
-        let path = self.base_dir.join("history").join(format!("{session_id}.jsonl"));
+        let path = self
+            .base_dir
+            .join("history")
+            .join(format!("{session_id}.jsonl"));
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => content
                 .lines()
@@ -335,8 +339,14 @@ mod tests {
         assert_eq!(list[0]["cwd"], "/some/path");
         // updatedAt should be an RFC3339 string, not a number
         let updated = list[0]["updatedAt"].as_str().unwrap();
-        assert!(updated.ends_with('Z'), "expected RFC3339 format, got {updated}");
-        assert!(updated.contains('T'), "expected RFC3339 format, got {updated}");
+        assert!(
+            updated.ends_with('Z'),
+            "expected RFC3339 format, got {updated}"
+        );
+        assert!(
+            updated.contains('T'),
+            "expected RFC3339 format, got {updated}"
+        );
         assert!(list[1].get("title").is_none());
     }
 
@@ -371,7 +381,10 @@ mod tests {
 
         assert_eq!(parsed["method"], "session/update");
         assert_eq!(parsed["params"]["sessionId"], "sess-1");
-        assert_eq!(parsed["params"]["update"]["sessionUpdate"], "user_message_chunk");
+        assert_eq!(
+            parsed["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
     }
 
     #[tokio::test]

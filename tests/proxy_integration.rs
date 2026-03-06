@@ -112,10 +112,7 @@ send '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
 }
 
 #[cfg(unix)]
-fn run_proxy_with_fake_agent(
-    fake_script: &std::path::Path,
-    input_lines: &[&str],
-) -> Vec<Value> {
+fn run_proxy_with_fake_agent(fake_script: &std::path::Path, input_lines: &[&str]) -> Vec<Value> {
     let binary = env!("CARGO_BIN_EXE_cursor-acp");
 
     let mut child = Command::new(binary)
@@ -203,7 +200,10 @@ fn proxy_forwards_normal_messages_and_intercepts_todos() {
                 .is_some_and(|s| s.starts_with("_cursor/"))
         })
         .collect();
-    assert!(cursor_methods.is_empty(), "no _cursor/ methods forwarded to Zed");
+    assert!(
+        cursor_methods.is_empty(),
+        "no _cursor/ methods forwarded to Zed"
+    );
 
     // agent_thought_chunk should be forwarded
     let thought_msgs: Vec<&Value> = messages
@@ -219,9 +219,7 @@ fn proxy_forwards_normal_messages_and_intercepts_todos() {
     // prompt result forwarded
     let prompt_result: Vec<&Value> = messages
         .iter()
-        .filter(|m| {
-            m.get("id").and_then(Value::as_u64) == Some(4) && m.get("result").is_some()
-        })
+        .filter(|m| m.get("id").and_then(Value::as_u64) == Some(4) && m.get("result").is_some())
         .collect();
     assert_eq!(prompt_result.len(), 1, "prompt result forwarded");
     assert_eq!(prompt_result[0]["result"]["stopReason"], "end_turn");
@@ -251,16 +249,24 @@ fn proxy_handles_todo_merge() {
         })
         .collect();
 
-    assert_eq!(plan_msgs.len(), 2, "two Plan notifications (one per update_todos)");
+    assert_eq!(
+        plan_msgs.len(),
+        2,
+        "two Plan notifications (one per update_todos)"
+    );
 
     // First plan: one entry
-    let entries1 = plan_msgs[0]["params"]["update"]["entries"].as_array().unwrap();
+    let entries1 = plan_msgs[0]["params"]["update"]["entries"]
+        .as_array()
+        .unwrap();
     assert_eq!(entries1.len(), 1);
     assert_eq!(entries1[0]["content"], "Step one");
     assert_eq!(entries1[0]["status"], "pending");
 
     // Second plan: two entries (merged), step one now completed
-    let entries2 = plan_msgs[1]["params"]["update"]["entries"].as_array().unwrap();
+    let entries2 = plan_msgs[1]["params"]["update"]["entries"]
+        .as_array()
+        .unwrap();
     assert_eq!(entries2.len(), 2);
     assert_eq!(entries2[0]["content"], "Step one");
     assert_eq!(entries2[0]["status"], "completed");

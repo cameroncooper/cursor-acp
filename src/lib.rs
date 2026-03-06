@@ -59,9 +59,7 @@ pub async fn run_main() -> Result<()> {
             if let Some(ref msg) = msg
                 && msg.get("method").and_then(Value::as_str) == Some("session/list")
             {
-                let cwd = msg
-                    .pointer("/params/cwd")
-                    .and_then(Value::as_str);
+                let cwd = msg.pointer("/params/cwd").and_then(Value::as_str);
                 let request_id = msg.get("id").cloned().unwrap_or(Value::Null);
                 let entries = stdin_store.list_sessions(cwd).await;
                 tracing::info!(count = entries.len(), ?cwd, "listed sessions");
@@ -94,12 +92,16 @@ pub async fn run_main() -> Result<()> {
                     });
                     let models = st.last_session_models.clone().unwrap_or_else(|| {
                         let current = st.selected_model.as_deref().unwrap_or("auto");
-                        let available: Vec<serde_json::Value> = st.models.iter().map(|m| {
-                            serde_json::json!({
-                                "modelId": m.id,
-                                "name": m.name,
+                        let available: Vec<serde_json::Value> = st
+                            .models
+                            .iter()
+                            .map(|m| {
+                                serde_json::json!({
+                                    "modelId": m.id,
+                                    "name": m.name,
+                                })
                             })
-                        }).collect();
+                            .collect();
                         serde_json::json!({
                             "currentModelId": current,
                             "availableModels": available,
@@ -107,19 +109,19 @@ pub async fn run_main() -> Result<()> {
                     });
                     (modes, models)
                 };
-                let response = sessions::build_load_response(
-                    &request_id,
-                    Some(&modes),
-                    Some(&models),
-                );
+                let response =
+                    sessions::build_load_response(&request_id, Some(&modes), Some(&models));
                 drop(stdin_to_zed.send(response));
 
                 // Replay stored history as session/update notifications.
                 let history = stdin_store.load_history(session_id).await;
-                tracing::info!(count = history.len(), session_id, "replaying session history");
+                tracing::info!(
+                    count = history.len(),
+                    session_id,
+                    "replaying session history"
+                );
                 for update in &history {
-                    let notification =
-                        sessions::build_history_notification(session_id, update);
+                    let notification = sessions::build_history_notification(session_id, update);
                     drop(stdin_to_zed.send(notification));
                 }
 
@@ -139,9 +141,7 @@ pub async fn run_main() -> Result<()> {
                 } else {
                     None
                 };
-                let cwd = cwd
-                    .or(stored_cwd)
-                    .unwrap_or_else(|| ".".to_string());
+                let cwd = cwd.or(stored_cwd).unwrap_or_else(|| ".".to_string());
 
                 let load_req_id = {
                     let mut st = stdin_state.lock().await;
@@ -331,7 +331,9 @@ fn spawn_child(binary: &str, model: Option<&str>) -> Result<Child> {
         cmd.arg("--model").arg(m);
     }
 
-    let child = cmd.spawn().with_context(|| format!("failed to spawn `{binary} acp`"))?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn `{binary} acp`"))?;
     Ok(child)
 }
 

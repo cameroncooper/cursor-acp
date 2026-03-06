@@ -150,10 +150,7 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
     // Suppress responses to our synthesized fs/ requests.
     if let Some(id) = msg.get("id")
         && (msg.get("result").is_some() || msg.get("error").is_some())
-        && let Some(pos) = state
-            .suppress_zed_response_ids
-            .iter()
-            .position(|s| s == id)
+        && let Some(pos) = state.suppress_zed_response_ids.iter().position(|s| s == id)
     {
         state.suppress_zed_response_ids.swap_remove(pos);
         tracing::debug!(?id, "suppressed Zed response to internal fs request");
@@ -183,10 +180,7 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
             ClientAction::Forward
         }
         Some("session/prompt") => {
-            if let Some(session_id) = msg
-                .pointer("/params/sessionId")
-                .and_then(Value::as_str)
-            {
+            if let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str) {
                 state.zed_session_id = Some(session_id.to_string());
             }
             let forwarded = remap_client_session_id(msg, state);
@@ -222,7 +216,11 @@ fn remap_client_session_id(msg: &Value, state: &ProxyState) -> String {
         if child_sid != zed_sid {
             let mut patched = msg.clone();
             patched["params"]["sessionId"] = json!(child_sid);
-            tracing::debug!(zed_sid, child_sid = child_sid.as_str(), "remapped client sessionId to child");
+            tracing::debug!(
+                zed_sid,
+                child_sid = child_sid.as_str(),
+                "remapped client sessionId to child"
+            );
             return patched.to_string();
         }
     }
@@ -355,10 +353,7 @@ fn inject_session_list_capability(msg: &Value) -> AgentAction {
     if let Some(caps) = patched.pointer_mut("/result/agentCapabilities")
         && let Some(obj) = caps.as_object_mut()
     {
-        obj.insert(
-            "sessionCapabilities".to_string(),
-            json!({ "list": {} }),
-        );
+        obj.insert("sessionCapabilities".to_string(), json!({ "list": {} }));
     }
     tracing::debug!("injected sessionCapabilities.list into initialize response");
     AgentAction::ForwardPatched(patched.to_string())
@@ -370,9 +365,7 @@ pub fn track_new_session(msg: &Value, state: &mut ProxyState) {
     if !is_session_new_response(msg) {
         return;
     }
-    let session_id = msg
-        .pointer("/result/sessionId")
-        .and_then(Value::as_str);
+    let session_id = msg.pointer("/result/sessionId").and_then(Value::as_str);
     let request_id = msg.get("id").map(|v| v.to_string());
     if let (Some(sid), Some(rid)) = (session_id, request_id) {
         // Always track the child's session ID.
@@ -417,7 +410,10 @@ pub fn extract_session_update(msg: &Value) -> Option<SessionUpdateInfo> {
     let update_type = update.get("sessionUpdate").and_then(Value::as_str);
 
     let title = if update_type == Some("session_info_update") {
-        update.get("title").and_then(Value::as_str).map(String::from)
+        update
+            .get("title")
+            .and_then(Value::as_str)
+            .map(String::from)
     } else {
         None
     };
@@ -513,11 +509,7 @@ fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<V
                 reqs.push(req.to_string());
             }
 
-            if reqs.is_empty() {
-                None
-            } else {
-                Some(reqs)
-            }
+            if reqs.is_empty() { None } else { Some(reqs) }
         }
         "tool_call_update" => {
             if update.get("status").and_then(Value::as_str) != Some("completed") {
@@ -549,11 +541,7 @@ fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<V
                 reqs.push(req.to_string());
             }
 
-            if reqs.is_empty() {
-                None
-            } else {
-                Some(reqs)
-            }
+            if reqs.is_empty() { None } else { Some(reqs) }
         }
         _ => None,
     }
@@ -592,10 +580,7 @@ fn is_session_new_response(msg: &Value) -> bool {
 fn inject_models_into_session_response(msg: &Value, state: &ProxyState) -> AgentAction {
     let mut patched = msg.clone();
 
-    let current = state
-        .selected_model
-        .as_deref()
-        .unwrap_or("auto");
+    let current = state.selected_model.as_deref().unwrap_or("auto");
 
     let available: Vec<Value> = state
         .models
@@ -615,7 +600,11 @@ fn inject_models_into_session_response(msg: &Value, state: &ProxyState) -> Agent
         });
     }
 
-    tracing::debug!(count = state.models.len(), current, "injected models into session/new");
+    tracing::debug!(
+        count = state.models.len(),
+        current,
+        "injected models into session/new"
+    );
     AgentAction::ForwardPatched(patched.to_string())
 }
 
@@ -660,16 +649,30 @@ fn maybe_extract_plan_from_tool_call(msg: &Value, state: &mut ProxyState) -> Opt
                 state.todos.clear();
             }
             for item in todos {
-                let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                let content = item.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let status = normalize_todo_status(
-                    item.get("status").and_then(Value::as_str).unwrap_or("pending"),
+                    item.get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pending"),
                 );
                 if let Some(existing) = state.todos.iter_mut().find(|t| t.id == id) {
                     existing.content = content;
                     existing.status = status;
                 } else {
-                    state.todos.push(TodoItem { id, content, status });
+                    state.todos.push(TodoItem {
+                        id,
+                        content,
+                        status,
+                    });
                 }
             }
             // Purge cancelled/placeholder/empty items from state entirely.
@@ -710,7 +713,11 @@ fn maybe_extract_plan_from_tool_call(msg: &Value, state: &mut ProxyState) -> Opt
         }
     });
 
-    tracing::debug!(count = entries.len(), tool_name, "emitted plan from tool call");
+    tracing::debug!(
+        count = entries.len(),
+        tool_name,
+        "emitted plan from tool call"
+    );
     Some(vec![notification.to_string()])
 }
 
@@ -721,7 +728,10 @@ fn parse_plan_entries(plan_text: &str) -> Vec<Value> {
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("- [x] ").or_else(|| trimmed.strip_prefix("- [X] ")) {
+            if let Some(rest) = trimmed
+                .strip_prefix("- [x] ")
+                .or_else(|| trimmed.strip_prefix("- [X] "))
+            {
                 Some(json!({ "content": rest.trim(), "priority": "medium", "status": "completed" }))
             } else if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
                 Some(json!({ "content": rest.trim(), "priority": "medium", "status": "pending" }))
@@ -976,7 +986,8 @@ mod tests {
                 response_to_child,
                 notifications_to_zed,
             } => {
-                let resp: Value = serde_json::from_str(response_to_child.as_ref().unwrap()).unwrap();
+                let resp: Value =
+                    serde_json::from_str(response_to_child.as_ref().unwrap()).unwrap();
                 assert_eq!(resp["id"], 5);
 
                 assert_eq!(notifications_to_zed.len(), 1);
@@ -1017,7 +1028,10 @@ mod tests {
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::Intercept { notifications_to_zed, .. } => {
+            AgentAction::Intercept {
+                notifications_to_zed,
+                ..
+            } => {
                 let notif: Value = serde_json::from_str(&notifications_to_zed[0]).unwrap();
                 let entries = notif["params"]["update"]["entries"].as_array().unwrap();
                 assert_eq!(entries.len(), 2);
@@ -1043,7 +1057,8 @@ mod tests {
                 response_to_child,
                 notifications_to_zed,
             } => {
-                let resp: Value = serde_json::from_str(response_to_child.as_ref().unwrap()).unwrap();
+                let resp: Value =
+                    serde_json::from_str(response_to_child.as_ref().unwrap()).unwrap();
                 assert_eq!(resp["id"], 10);
                 assert!(notifications_to_zed.is_empty());
             }
@@ -1066,7 +1081,10 @@ mod tests {
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::Intercept { notifications_to_zed, .. } => {
+            AgentAction::Intercept {
+                notifications_to_zed,
+                ..
+            } => {
                 assert!(notifications_to_zed.is_empty());
             }
             _ => panic!("expected Intercept"),
@@ -1114,7 +1132,10 @@ mod tests {
             ClientAction::ForwardPatched(patched) => {
                 let parsed: Value = serde_json::from_str(&patched).unwrap();
                 assert!(parsed.pointer("/params/clientCapabilities/_meta").is_none());
-                assert_eq!(parsed.pointer("/params/clientCapabilities/terminal"), Some(&json!(true)));
+                assert_eq!(
+                    parsed.pointer("/params/clientCapabilities/terminal"),
+                    Some(&json!(true))
+                );
             }
             _ => panic!("expected ForwardPatched"),
         }
@@ -1155,7 +1176,10 @@ mod tests {
         });
 
         match process_client_message(&msg, &mut state) {
-            ClientAction::Respond { response_to_zed, restart_with_model } => {
+            ClientAction::Respond {
+                response_to_zed,
+                restart_with_model,
+            } => {
                 let resp: Value = serde_json::from_str(&response_to_zed).unwrap();
                 assert_eq!(resp["id"], 5);
                 assert_eq!(restart_with_model, Some("opus-4.6-thinking".to_string()));
@@ -1169,8 +1193,14 @@ mod tests {
     fn inject_models_into_session_new_response() {
         let mut state = ProxyState::new();
         state.models = vec![
-            ModelInfo { id: "auto".into(), name: "Auto".into() },
-            ModelInfo { id: "opus-4.6".into(), name: "Claude 4.6 Opus".into() },
+            ModelInfo {
+                id: "auto".into(),
+                name: "Auto".into(),
+            },
+            ModelInfo {
+                id: "opus-4.6".into(),
+                name: "Claude 4.6 Opus".into(),
+            },
         ];
         state.selected_model = Some("opus-4.6".into());
 
@@ -1242,7 +1272,10 @@ Tip: use --model <id> to switch.
         assert_eq!(normalize_todo_status("pending"), "pending");
         assert_eq!(normalize_todo_status("TODO_STATUS_PENDING"), "pending");
         assert_eq!(normalize_todo_status("in_progress"), "in_progress");
-        assert_eq!(normalize_todo_status("TODO_STATUS_IN_PROGRESS"), "in_progress");
+        assert_eq!(
+            normalize_todo_status("TODO_STATUS_IN_PROGRESS"),
+            "in_progress"
+        );
         assert_eq!(normalize_todo_status("completed"), "completed");
         assert_eq!(normalize_todo_status("TODO_STATUS_COMPLETED"), "completed");
         assert_eq!(normalize_todo_status("cancelled"), "cancelled");
@@ -1277,7 +1310,10 @@ Tip: use --model <id> to switch.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra { extra_notifications, .. } => {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
                 let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 let entries = notif["params"]["update"]["entries"].as_array().unwrap();
                 assert_eq!(entries.len(), 1);
@@ -1364,7 +1400,9 @@ Tip: use --model <id> to switch.
     #[test]
     fn new_session_deferred_creation() {
         let mut state = ProxyState::new();
-        state.pending_new_session_cwds.insert("3".to_string(), "/test".to_string());
+        state
+            .pending_new_session_cwds
+            .insert("3".to_string(), "/test".to_string());
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -1378,7 +1416,13 @@ Tip: use --model <id> to switch.
         // track_new_session stores in pending_sessions, not created yet.
         track_new_session(&msg, &mut state);
         assert_eq!(state.zed_session_id.as_deref(), Some("new-sess-id"));
-        assert_eq!(state.pending_sessions.get("new-sess-id").map(String::as_str), Some("/test"));
+        assert_eq!(
+            state
+                .pending_sessions
+                .get("new-sess-id")
+                .map(String::as_str),
+            Some("/test")
+        );
 
         // take_pending_session removes from pending and returns it.
         let taken = take_pending_session(&mut state);
@@ -1416,7 +1460,10 @@ Tip: use --model <id> to switch.
         let plan = "# Jokes File Lifecycle\n\n1. Create an empty `jokes.txt` in the workspace root.\n2. Write a joke into `jokes.txt`.\n3. Delete `jokes.txt`.\n";
         let entries = parse_plan_entries(plan);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0]["content"], "Create an empty `jokes.txt` in the workspace root.");
+        assert_eq!(
+            entries[0]["content"],
+            "Create an empty `jokes.txt` in the workspace root."
+        );
         assert_eq!(entries[1]["content"], "Write a joke into `jokes.txt`.");
         assert_eq!(entries[2]["content"], "Delete `jokes.txt`.");
     }
@@ -1446,7 +1493,10 @@ Tip: use --model <id> to switch.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra { extra_notifications, .. } => {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
                 assert_eq!(extra_notifications.len(), 1);
                 let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(notif["params"]["sessionId"], "zed-sess");
@@ -1507,13 +1557,19 @@ Tip: use --model <id> to switch.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra { extra_notifications, .. } => {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
                 assert_eq!(extra_notifications.len(), 1);
                 let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(notif["params"]["sessionId"], "zed-sess");
                 let entries = notif["params"]["update"]["entries"].as_array().unwrap();
                 assert_eq!(entries.len(), 3);
-                assert_eq!(entries[0]["content"], "Create jokes.txt in the workspace root");
+                assert_eq!(
+                    entries[0]["content"],
+                    "Create jokes.txt in the workspace root"
+                );
                 assert_eq!(entries[0]["status"], "pending");
                 assert_eq!(entries[1]["content"], "Add a joke to jokes.txt");
                 assert_eq!(entries[1]["status"], "in_progress");
@@ -1571,7 +1627,10 @@ Tip: use --model <id> to switch.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::Intercept { notifications_to_zed, .. } => {
+            AgentAction::Intercept {
+                notifications_to_zed,
+                ..
+            } => {
                 assert_eq!(notifications_to_zed.len(), 1);
                 let notif: Value = serde_json::from_str(&notifications_to_zed[0]).unwrap();
                 // Plan notification should use zed_session_id, not child_id
@@ -1604,7 +1663,10 @@ Tip: use --model <id> to switch.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra { extra_notifications, .. } => {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
                 assert_eq!(extra_notifications.len(), 1);
                 let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(req["method"], "fs/read_text_file");
@@ -1642,7 +1704,10 @@ Tip: use --model <id> to switch.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra { extra_notifications, .. } => {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
                 assert_eq!(extra_notifications.len(), 1);
                 let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(req["method"], "fs/write_text_file");
