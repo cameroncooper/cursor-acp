@@ -1,10 +1,10 @@
 [package]
 name = "cursor-acp"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 authors = ["Cursor ACP Contributors"]
 license = "MIT"
-description = "ACP adapter for Cursor headless CLI"
+description = "ACP proxy for Cursor CLI — translates Cursor-specific extensions (like todos) into standard ACP Plan updates"
 
 [[bin]]
 name = "cursor-acp"
@@ -15,18 +15,12 @@ name = "cursor_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { version = "=0.9.4", features = ["unstable"] }
 anyhow = "1"
-async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "sync"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "sync", "time", "fs"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1", features = ["v4"] }
-thiserror = "2"
-chrono = { version = "0.4", default-features = true }
 
 [lints.rust]
 let-underscore = "warn"
@@ -34,5 +28,4 @@ rust-2018-idioms = "warn"
 unused = "warn"
 
 [dev-dependencies]
-piper = "0.2"
 tempfile = "3"

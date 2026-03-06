@@ -1,16 +1,17 @@
 id = "cursor-acp"
 name = "Cursor ACP"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
-description = "ACP adapter for Cursor headless CLI"
+description = "ACP proxy for Cursor CLI — adds Plan UI from Cursor's todo list"
 repository = "https://github.com/cameroncooper/cursor-acp"
 authors = ["Cursor ACP Contributors"]
 
 [agent_servers.cursor-acp]
-name = "Cursor"
+name = "Cursor CLI"
+icon = "icon/cursor.svg"
 
 [agent_servers.cursor-acp.env]
-RUST_LOG = "info"
+RUST_LOG = "warn"
 
 [agent_servers.cursor-acp.targets.darwin-aarch64]
 archive = "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-aarch64-apple-darwin.tar.gz"
