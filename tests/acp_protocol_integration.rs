@@ -14,9 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-fn managed_edits_env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn managed_edits_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[derive(Clone, Default)]
@@ -608,7 +608,7 @@ async fn prompt_stream_emits_session_updates() {
                 tokio::task::yield_now().await;
             }
 
-            let updates = client.notifications.lock().unwrap();
+            let updates = client.notifications.lock().unwrap().clone();
             assert!(
                 updates
                     .iter()
@@ -657,7 +657,6 @@ async fn prompt_stream_emits_session_updates() {
             });
             assert!(has_final_text, "expected final streamed result message");
 
-            drop(updates);
             client.notifications.lock().unwrap().clear();
 
             client_conn
@@ -799,7 +798,7 @@ async fn list_sessions_filters_by_cwd_and_orders_by_recency() {
 
 #[tokio::test]
 async fn ask_mode_disables_force_and_agent_mode_enables_it() {
-    let _env_guard = managed_edits_env_lock().lock().unwrap();
+    let _env_guard = managed_edits_env_lock().lock().await;
     // This test validates the --force behavior when managed edits are disabled.
     unsafe {
         std::env::set_var("CURSOR_ACP_MANAGED_EDITS", "0");
@@ -884,7 +883,7 @@ async fn ask_mode_disables_force_and_agent_mode_enables_it() {
 
 #[tokio::test]
 async fn ask_mode_blocks_managed_edit_writes() {
-    let _env_guard = managed_edits_env_lock().lock().unwrap();
+    let _env_guard = managed_edits_env_lock().lock().await;
     unsafe {
         std::env::set_var("CURSOR_ACP_MANAGED_EDITS", "1");
     }

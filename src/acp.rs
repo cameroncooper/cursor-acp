@@ -1,7 +1,7 @@
 use crate::auth::{AUTH_METHOD_CURSOR_LOGIN, terminal_auth_method};
 use crate::cli::{CursorCliConfig, CursorCliRuntime};
 use crate::error::ErrorKind;
-use crate::prompt::PromptEngine;
+use crate::prompt::{PromptEngine, PromptRunOptions};
 use crate::session::{SessionState, SessionStore};
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
@@ -136,6 +136,7 @@ impl CursorAcpAgent {
                 ))
             }
             crate::cli::CursorCliEvent::ToolCallUpdate(tool_call) => {
+                let tool_call = tool_call.as_ref();
                 let locations: Vec<ToolCallLocation> = tool_call
                     .locations
                     .iter()
@@ -245,10 +246,10 @@ impl CursorAcpAgent {
                 .and_then(|meta| meta.get(key))
                 .and_then(serde_json::Value::as_str)
                 .map(PathBuf::from);
-            if let Some(path) = value {
-                if path.is_absolute() {
-                    return Some(path);
-                }
+            if let Some(path) = value
+                && path.is_absolute()
+            {
+                return Some(path);
             }
         }
         None
@@ -384,6 +385,7 @@ impl CursorAcpAgent {
         let crate::cli::CursorCliEvent::ToolCallUpdate(tool_call) = event else {
             return Ok(());
         };
+        let tool_call = tool_call.as_ref();
         if tool_call.status != ToolCallStatus::Completed
             || tool_call.kind != agent_client_protocol::ToolKind::Edit
         {
@@ -656,6 +658,13 @@ impl Agent for CursorAcpAgent {
         let cli_sandbox = Self::cli_sandbox_for_session(&session);
         let managed_edits = Self::managed_edits_enabled();
         let cli_allow_edits = allow_edits && !managed_edits;
+        let prompt_options = PromptRunOptions {
+            prompt_text: prompt_text.clone(),
+            mode: cli_mode.clone(),
+            sandbox: cli_sandbox.clone(),
+            allow_edits: cli_allow_edits,
+            trust_workspace,
+        };
         let streaming_requested = request
             .meta
             .as_ref()
@@ -723,15 +732,7 @@ impl Agent for CursorAcpAgent {
 
             let streamed = self
                 .prompt_engine
-                .run_prompt_stream_events(
-                    &session,
-                    prompt_text.clone(),
-                    cli_mode.clone(),
-                    cli_sandbox.clone(),
-                    cli_allow_edits,
-                    trust_workspace,
-                    Some(event_tx),
-                )
+                .run_prompt_stream_events(&session, prompt_options.clone(), Some(event_tx))
                 .await;
             let notify_result = notify_task.await.map_err(|error| {
                 Error::internal_error().data(serde_json::json!({
@@ -785,14 +786,7 @@ impl Agent for CursorAcpAgent {
         } else {
             let (result, stop_reason) = self
                 .prompt_engine
-                .run_prompt_non_stream(
-                    &session,
-                    prompt_text.clone(),
-                    cli_mode,
-                    cli_sandbox,
-                    cli_allow_edits,
-                    trust_workspace,
-                )
+                .run_prompt_non_stream(&session, prompt_options)
                 .await
                 .map_err(Self::map_error)?;
             if let Some(usage) = result.usage {
@@ -843,8 +837,10 @@ impl Agent for CursorAcpAgent {
                 ));
                 persisted_updates.push(failure_update.clone());
                 let serialized = Self::serialize_session_updates_for_history(persisted_updates);
-                let mut store = self.session_store.lock().unwrap();
-                store.append_history_updates(&session.id, serialized);
+                {
+                    let mut store = self.session_store.lock().unwrap();
+                    store.append_history_updates(&session.id, serialized);
+                }
                 self.notify_session_update(session.id.clone(), failure_update)
                     .await?;
                 Ok(PromptResponse::new(stop_reason))
@@ -860,15 +856,16 @@ impl Agent for CursorAcpAgent {
         &self,
         request: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
-        let mut store = self.session_store.lock().unwrap();
         let mode_id = request.mode_id.clone();
-        let ok = store.set_mode(&request.session_id, mode_id.clone());
+        let ok = {
+            let mut store = self.session_store.lock().unwrap();
+            store.set_mode(&request.session_id, mode_id.clone())
+        };
         if !ok {
             let mut error = Error::invalid_params();
             error.message = "Unknown mode or session".to_string();
             return Err(error);
         }
-        drop(store);
 
         {
             let mut gate = self.edit_enabled_sessions.lock().unwrap();

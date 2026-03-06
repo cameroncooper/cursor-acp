@@ -50,12 +50,24 @@ pub struct CursorUsageUpdate {
 }
 
 #[derive(Debug, Clone)]
+pub struct CursorPromptRequest {
+    pub prompt: String,
+    pub mode: Option<String>,
+    pub sandbox: Option<String>,
+    pub model: Option<String>,
+    pub resume: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub allow_edits: bool,
+    pub trust_workspace: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum CursorCliEvent {
     AssistantDelta(String),
     ThinkingDelta(String),
     System { message: String, raw: Value },
     ToolCallStart(CursorCliToolCall),
-    ToolCallUpdate(CursorCliToolCallUpdate),
+    ToolCallUpdate(Box<CursorCliToolCallUpdate>),
     Result(CursorPromptResult),
     Other(Value),
 }
@@ -128,45 +140,10 @@ impl CursorCliRuntime {
 
     pub async fn run_prompt_json(
         &self,
-        prompt: String,
-        mode: Option<String>,
-        sandbox: Option<String>,
-        model: Option<String>,
-        resume: Option<String>,
-        cwd: Option<PathBuf>,
-        allow_edits: bool,
-        trust_workspace: bool,
+        request: CursorPromptRequest,
     ) -> Result<CursorPromptResult, ErrorKind> {
-        let mut args = vec![
-            "-p".to_string(),
-            "--output-format".to_string(),
-            "json".to_string(),
-        ];
-        if allow_edits {
-            args.push("--force".to_string());
-        }
-        if trust_workspace {
-            args.push("--trust".to_string());
-        }
-        if let Some(mode_id) = mode {
-            args.push("--mode".to_string());
-            args.push(mode_id);
-        }
-        if let Some(sandbox_mode) = sandbox {
-            args.push("--sandbox".to_string());
-            args.push(sandbox_mode);
-        }
-        if let Some(model_id) = model {
-            args.push("--model".to_string());
-            args.push(model_id);
-        }
-        if let Some(resume_id) = resume {
-            args.push("--resume".to_string());
-            args.push(resume_id);
-        }
-        args.push(prompt);
-
-        let output = self.run_command(args, cwd).await?;
+        let args = Self::build_prompt_args(&request, "json", false);
+        let output = self.run_command(args, request.cwd).await?;
         let parsed: Value =
             serde_json::from_str(&output.stdout).map_err(|_| ErrorKind::CliProtocolViolation {
                 parser_phase: "json_prompt",
@@ -176,7 +153,7 @@ impl CursorCliRuntime {
         let text = parsed
             .get("result")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| output.stdout.as_str())
+            .unwrap_or(output.stdout.as_str())
             .to_string();
 
         let usage = extract_usage_update(&parsed);
@@ -189,49 +166,13 @@ impl CursorCliRuntime {
 
     pub async fn run_prompt_stream(
         &self,
-        prompt: String,
-        mode: Option<String>,
-        sandbox: Option<String>,
-        model: Option<String>,
-        resume: Option<String>,
-        cwd: Option<PathBuf>,
-        allow_edits: bool,
-        trust_workspace: bool,
+        request: CursorPromptRequest,
         event_tx: Option<UnboundedSender<CursorCliEvent>>,
     ) -> Result<Vec<CursorCliEvent>, ErrorKind> {
-        let mut args = vec![
-            "-p".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--stream-partial-output".to_string(),
-        ];
-        if allow_edits {
-            args.push("--force".to_string());
-        }
-        if trust_workspace {
-            args.push("--trust".to_string());
-        }
-        if let Some(mode_id) = mode {
-            args.push("--mode".to_string());
-            args.push(mode_id);
-        }
-        if let Some(sandbox_mode) = sandbox {
-            args.push("--sandbox".to_string());
-            args.push(sandbox_mode);
-        }
-        if let Some(model_id) = model {
-            args.push("--model".to_string());
-            args.push(model_id);
-        }
-        if let Some(resume_id) = resume {
-            args.push("--resume".to_string());
-            args.push(resume_id);
-        }
-        args.push(prompt);
-
+        let args = Self::build_prompt_args(&request, "stream-json", true);
         let mut command = Command::new(&self.config.binary);
         command.args(args);
-        if let Some(path) = cwd {
+        if let Some(path) = request.cwd {
             command.current_dir(path);
         }
         command.stdin(Stdio::null());
@@ -388,6 +329,45 @@ impl CursorCliRuntime {
         Ok(events)
     }
 
+    fn build_prompt_args(
+        request: &CursorPromptRequest,
+        output_format: &str,
+        stream_partial_output: bool,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            output_format.to_string(),
+        ];
+        if stream_partial_output {
+            args.push("--stream-partial-output".to_string());
+        }
+        if request.allow_edits {
+            args.push("--force".to_string());
+        }
+        if request.trust_workspace {
+            args.push("--trust".to_string());
+        }
+        if let Some(mode_id) = request.mode.as_ref() {
+            args.push("--mode".to_string());
+            args.push(mode_id.clone());
+        }
+        if let Some(sandbox_mode) = request.sandbox.as_ref() {
+            args.push("--sandbox".to_string());
+            args.push(sandbox_mode.clone());
+        }
+        if let Some(model_id) = request.model.as_ref() {
+            args.push("--model".to_string());
+            args.push(model_id.clone());
+        }
+        if let Some(resume_id) = request.resume.as_ref() {
+            args.push("--resume".to_string());
+            args.push(resume_id.clone());
+        }
+        args.push(request.prompt.clone());
+        args
+    }
+
     pub(crate) fn classify_cli_failure(exit_code: Option<i32>, stderr: &str) -> Option<ErrorKind> {
         let lower = stderr.to_lowercase();
         if lower.contains("cannot use this model") || lower.contains("available models") {
@@ -487,10 +467,11 @@ fn extract_assistant_deltas(parsed: &Value) -> Vec<String> {
         parsed.get("delta"),
         parsed.pointer("/message/content"),
         parsed.pointer("/message/delta"),
-    ] {
-        if let Some(candidate) = candidate {
-            collect_text_chunks(candidate, &mut chunks);
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        collect_text_chunks(candidate, &mut chunks);
     }
 
     if chunks.is_empty() {
@@ -534,19 +515,21 @@ fn parse_tool_call_events(
         }));
     }
 
-    events.push(CursorCliEvent::ToolCallUpdate(CursorCliToolCallUpdate {
-        tool_call_id,
-        kind: descriptor.kind,
-        status: map_tool_status(subtype),
-        title: Some(descriptor.title),
-        locations: descriptor.locations,
-        message: descriptor.message,
-        raw_input: descriptor.raw_input,
-        raw_output: descriptor.raw_output,
-        diff: descriptor.diff,
-        managed_write_text: descriptor.managed_write_text,
-        todo_items: descriptor.todo_items,
-    }));
+    events.push(CursorCliEvent::ToolCallUpdate(Box::new(
+        CursorCliToolCallUpdate {
+            tool_call_id,
+            kind: descriptor.kind,
+            status: map_tool_status(subtype),
+            title: Some(descriptor.title),
+            locations: descriptor.locations,
+            message: descriptor.message,
+            raw_input: descriptor.raw_input,
+            raw_output: descriptor.raw_output,
+            diff: descriptor.diff,
+            managed_write_text: descriptor.managed_write_text,
+            todo_items: descriptor.todo_items,
+        },
+    )));
 
     events
 }
@@ -1403,7 +1386,7 @@ mod tests {
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         assert!(!events.is_empty());
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected ToolCallUpdate");
@@ -1456,7 +1439,7 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected ToolCallUpdate");
@@ -1486,7 +1469,7 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "started", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected ToolCallUpdate");
@@ -1609,7 +1592,7 @@ mod tests {
             CursorCliEvent::ToolCallUpdate(update)
                 if update.status == ToolCallStatus::Completed =>
             {
-                Some(update)
+                Some(*update)
             }
             _ => None,
         });
@@ -1629,7 +1612,7 @@ mod tests {
                 CursorCliEvent::ToolCallUpdate(update)
                     if update.status == ToolCallStatus::Completed =>
                 {
-                    Some(update)
+                    Some(update.as_ref())
                 }
                 _ => None,
             })
@@ -1670,7 +1653,7 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected tool update");
@@ -1711,7 +1694,7 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected tool update");
