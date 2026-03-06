@@ -1,0 +1,43 @@
+id = "cursor-acp"
+name = "Cursor ACP"
+version = "0.1.0"
+schema_version = 0
+description = "ACP adapter for Cursor headless CLI"
+repository = "https://github.com/cameroncooper/cursor-acp"
+authors = ["Cursor ACP Contributors"]
+
+[agent_servers.cursor-acp]
+name = "Cursor"
+
+[agent_servers.cursor-acp.env]
+RUST_LOG = "info"
+
+[agent_servers.cursor-acp.targets.darwin-aarch64]
+archive = "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-aarch64-apple-darwin.tar.gz"
+cmd = "./cursor-acp"
+args = []
+
+[agent_servers.cursor-acp.targets.darwin-x86_64]
+archive = "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-x86_64-apple-darwin.tar.gz"
+cmd = "./cursor-acp"
+args = []
+
+[agent_servers.cursor-acp.targets.linux-aarch64]
+archive = "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-aarch64-unknown-linux-musl.tar.gz"
+cmd = "./cursor-acp"
+args = []
+
+[agent_servers.cursor-acp.targets.linux-x86_64]
+archive = "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-x86_64-unknown-linux-musl.tar.gz"
+cmd = "./cursor-acp"
+args = []
+
+[agent_servers.cursor-acp.targets.windows-aarch64]
+archive = "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-aarch64-pc-windows-msvc.zip"
+cmd = "cursor-acp.exe"
+args = []
+
+[agent_servers.cursor-acp.targets.windows-x86_64]
+archive = "https://github.com/cameroncooper/cursor-acp/releases/download/v0.1.0/cursor-acp-0.1.0-x86_64-pc-windows-msvc.zip"
+cmd = "cursor-acp.exe"
+args = []
