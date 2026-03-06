@@ -108,7 +108,8 @@ impl ErrorKind {
             Self::TransientIo(detail) => {
                 let mut error = AcpError::internal_error();
                 error.message = "transient io error".to_string();
-                error.data = Some(serde_json::json!({ "reason": "transient_io", "detail": detail }));
+                error.data =
+                    Some(serde_json::json!({ "reason": "transient_io", "detail": detail }));
                 error
             }
             Self::Internal(detail) => {

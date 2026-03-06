@@ -2,12 +2,12 @@ use agent_client_protocol::{
     Agent, AgentSideConnection, Client, ClientSideConnection, ContentBlock, ContentChunk,
     CreateTerminalRequest, CreateTerminalResponse, ExtNotification, ExtRequest, ExtResponse,
     Implementation, InitializeRequest, KillTerminalCommandRequest, KillTerminalCommandResponse,
-    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PlanEntryStatus, PromptRequest, ProtocolVersion,
-    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionNotification, SessionUpdate,
-    SetSessionModeRequest,
-    TerminalOutputRequest, TerminalOutputResponse, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PlanEntryStatus, PromptRequest,
+    ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
+    ReleaseTerminalResponse, RequestPermissionRequest, RequestPermissionResponse,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, TerminalOutputRequest,
+    TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use cursor_acp::acp::CursorAcpAgent;
 use std::fs;
@@ -147,9 +147,33 @@ fn create_connection_pair(
     (client_conn, agent_conn)
 }
 
+fn write_probe_cursor_agent_script(
+    dir: &Path,
+    stem: &str,
+    unix_body: &str,
+    windows_body: &str,
+) -> PathBuf {
+    let extension = if cfg!(windows) { "cmd" } else { "sh" };
+    let script = dir.join(format!("{stem}.{extension}"));
+    let body = if cfg!(windows) {
+        windows_body
+    } else {
+        unix_body
+    };
+
+    fs::write(&script, body).expect("failed to write fake cursor script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+    }
+    script
+}
+
 fn write_fake_cursor_agent_script(dir: &Path) -> PathBuf {
-    let script = dir.join("fake-cursor-agent.sh");
-    let body = r#"#!/bin/sh
+    let unix_body = r#"#!/bin/sh
 if [ "$1" = "status" ]; then
   echo "Logged in"
   exit 0
@@ -182,21 +206,45 @@ fi
 
 echo '{"result":"non-stream result","usage":{"inputTokens":12,"outputTokens":7}}'
 "#;
+    let windows_body = r#"@echo off
+if /I "%~1"=="status" (
+  echo Logged in
+  exit /b 0
+)
 
-    fs::write(&script, body).expect("failed to write fake cursor script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-    }
-    script
+if /I "%~1"=="models" (
+  echo auto - Auto
+  echo gpt-5 - GPT-5
+  exit /b 0
+)
+
+set "fmt="
+set "prev="
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%prev%"=="--output-format" set "fmt=%~1"
+set "prev=%~1"
+shift
+goto parse_args
+:done_args
+
+if /I "%fmt%"=="stream-json" (
+  echo {"type":"system","subtype":"init","model":"gpt-5"}
+  echo {"type":"tool_call","subtype":"started","tool_call":{"readToolCall":{"args":{"path":"src/main.rs"}}}}
+  echo {"type":"assistant","message":{"content":[{"text":"stream piece"}]}}
+  echo {"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/main.rs"},"result":{"success":{"totalLines":10}}}}}
+  echo {"type":"system","subtype":"thinking","message":"analyzing"}
+  echo {"type":"result","result":"final streamed result","session_id":"resume-123","usage":{"inputTokens":100,"outputTokens":30}}
+  exit /b 0
+)
+
+echo {"result":"non-stream result","usage":{"inputTokens":12,"outputTokens":7}}
+"#;
+    write_probe_cursor_agent_script(dir, "fake-cursor-agent", unix_body, windows_body)
 }
 
 fn write_force_probe_cursor_agent_script(dir: &Path) -> PathBuf {
-    let script = dir.join("fake-cursor-agent-force-probe.sh");
-    let body = r#"#!/bin/sh
+    let unix_body = r#"#!/bin/sh
 if [ "$1" = "status" ]; then
   echo "Logged in"
   exit 0
@@ -229,21 +277,48 @@ fi
 
 echo "{\"result\":\"forced=$forced\"}"
 "#;
+    let windows_body = r#"@echo off
+if /I "%~1"=="status" (
+  echo Logged in
+  exit /b 0
+)
 
-    fs::write(&script, body).expect("failed to write fake cursor script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-    }
-    script
+if /I "%~1"=="models" (
+  echo auto - Auto
+  echo gpt-5 - GPT-5
+  exit /b 0
+)
+
+set "forced=0"
+set "fmt="
+set "prev="
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%~1"=="--force" set "forced=1"
+if /I "%prev%"=="--output-format" set "fmt=%~1"
+set "prev=%~1"
+shift
+goto parse_args
+:done_args
+
+if /I "%fmt%"=="stream-json" (
+  echo {"type":"assistant","message":{"content":[{"text":"forced=%forced%"}]}}
+  echo {"type":"result","result":"forced=%forced%"}
+  exit /b 0
+)
+
+echo {"result":"forced=%forced%"}
+"#;
+    write_probe_cursor_agent_script(
+        dir,
+        "fake-cursor-agent-force-probe",
+        unix_body,
+        windows_body,
+    )
 }
 
 fn write_managed_edit_probe_cursor_agent_script(dir: &Path) -> PathBuf {
-    let script = dir.join("fake-cursor-agent-managed-edit-probe.sh");
-    let body = r#"#!/bin/sh
+    let unix_body = r#"#!/bin/sh
 if [ "$1" = "status" ]; then
   echo "Logged in"
   exit 0
@@ -272,21 +347,46 @@ fi
 
 echo '{"result":"done"}'
 "#;
+    let windows_body = r#"@echo off
+if /I "%~1"=="status" (
+  echo Logged in
+  exit /b 0
+)
 
-    fs::write(&script, body).expect("failed to write fake cursor script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-    }
-    script
+if /I "%~1"=="models" (
+  echo auto - Auto
+  echo gpt-5 - GPT-5
+  exit /b 0
+)
+
+set "fmt="
+set "prev="
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%prev%"=="--output-format" set "fmt=%~1"
+set "prev=%~1"
+shift
+goto parse_args
+:done_args
+
+if /I "%fmt%"=="stream-json" (
+  echo {"type":"tool_call","subtype":"completed","tool_call":{"editToolCall":{"args":{"path":"C:\\tmp\\managed-edit.txt","new_string":"hello"},"result":{"success":{"afterFullFileContent":"hello"}}}}}
+  echo {"type":"result","result":"done"}
+  exit /b 0
+)
+
+echo {"result":"done"}
+"#;
+    write_probe_cursor_agent_script(
+        dir,
+        "fake-cursor-agent-managed-edit-probe",
+        unix_body,
+        windows_body,
+    )
 }
 
 fn write_mode_probe_cursor_agent_script(dir: &Path) -> PathBuf {
-    let script = dir.join("fake-cursor-agent-mode-probe.sh");
-    let body = r#"#!/bin/sh
+    let unix_body = r#"#!/bin/sh
 if [ "$1" = "status" ]; then
   echo "Logged in"
   exit 0
@@ -326,21 +426,47 @@ fi
 
 echo '{"result":"mode=unknown sandbox=none"}'
 "#;
+    let windows_body = r#"@echo off
+if /I "%~1"=="status" (
+  echo Logged in
+  exit /b 0
+)
 
-    fs::write(&script, body).expect("failed to write fake cursor script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-    }
-    script
+if /I "%~1"=="models" (
+  echo auto - Auto
+  echo gpt-5 - GPT-5
+  exit /b 0
+)
+
+set "fmt="
+set "mode="
+set "sandbox=none"
+set "prev="
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%prev%"=="--output-format" set "fmt=%~1"
+if /I "%prev%"=="--mode" set "mode=%~1"
+if /I "%prev%"=="--sandbox" set "sandbox=%~1"
+set "prev=%~1"
+shift
+goto parse_args
+:done_args
+
+if "%mode%"=="" set "mode=none"
+
+if /I "%fmt%"=="stream-json" (
+  echo {"type":"assistant","message":{"content":[{"text":"mode=%mode% sandbox=%sandbox%"}]}}
+  echo {"type":"result","result":"mode=%mode% sandbox=%sandbox%"}
+  exit /b 0
+)
+
+echo {"result":"mode=unknown sandbox=none"}
+"#;
+    write_probe_cursor_agent_script(dir, "fake-cursor-agent-mode-probe", unix_body, windows_body)
 }
 
 fn write_todo_plan_probe_cursor_agent_script(dir: &Path) -> PathBuf {
-    let script = dir.join("fake-cursor-agent-todo-plan-probe.sh");
-    let body = r#"#!/bin/sh
+    let unix_body = r#"#!/bin/sh
 if [ "$1" = "status" ]; then
   echo "Logged in"
   exit 0
@@ -369,16 +495,42 @@ fi
 
 echo '{"result":"todo updated"}'
 "#;
+    let windows_body = r#"@echo off
+if /I "%~1"=="status" (
+  echo Logged in
+  exit /b 0
+)
 
-    fs::write(&script, body).expect("failed to write fake cursor script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-    }
-    script
+if /I "%~1"=="models" (
+  echo auto - Auto
+  echo gpt-5 - GPT-5
+  exit /b 0
+)
+
+set "fmt="
+set "prev="
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%prev%"=="--output-format" set "fmt=%~1"
+set "prev=%~1"
+shift
+goto parse_args
+:done_args
+
+if /I "%fmt%"=="stream-json" (
+  echo {"type":"tool_call","subtype":"completed","tool_call":{"updateTodosToolCall":{"args":{"todos":[{"id":"1","content":"Investigate issue","status":"TODO_STATUS_PENDING"},{"id":"2","content":"Implement fix","status":"TODO_STATUS_IN_PROGRESS"}],"merge":false},"result":{"success":{"todos":[{"id":"1","content":"Investigate issue","status":"TODO_STATUS_COMPLETED"},{"id":"2","content":"Implement fix","status":"TODO_STATUS_IN_PROGRESS"}]}}}}}
+  echo {"type":"result","result":"todo updated"}
+  exit /b 0
+)
+
+echo {"result":"todo updated"}
+"#;
+    write_probe_cursor_agent_script(
+        dir,
+        "fake-cursor-agent-todo-plan-probe",
+        unix_body,
+        windows_body,
+    )
 }
 
 #[tokio::test]
@@ -395,12 +547,13 @@ async fn initialize_and_session_round_trip() {
 
             let (client_conn, _agent_conn) = create_connection_pair(&client, &agent);
 
-            let init = client_conn
-                .initialize(InitializeRequest::new(ProtocolVersion::LATEST).client_info(
-                    Implementation::new("test-client", "0.0.0").title("Test Client"),
-                ))
-                .await
-                .expect("initialize should succeed");
+            let init =
+                client_conn
+                    .initialize(InitializeRequest::new(ProtocolVersion::LATEST).client_info(
+                        Implementation::new("test-client", "0.0.0").title("Test Client"),
+                    ))
+                    .await
+                    .expect("initialize should succeed");
             assert_eq!(init.protocol_version, ProtocolVersion::V1);
 
             let new_session = client_conn
@@ -549,7 +702,10 @@ async fn load_unknown_session_id_returns_not_found() {
             let result = client_conn
                 .load_session(LoadSessionRequest::new("previous-session-id", temp.path()))
                 .await;
-            assert!(result.is_err(), "unknown session IDs should not auto-create");
+            assert!(
+                result.is_err(),
+                "unknown session IDs should not auto-create"
+            );
         })
         .await;
 }
@@ -582,11 +738,17 @@ async fn list_sessions_filters_by_cwd_and_orders_by_recency() {
                 .expect("new session B should succeed");
 
             client_conn
-                .prompt(PromptRequest::new(session_a.session_id.clone(), vec!["first".into()]))
+                .prompt(PromptRequest::new(
+                    session_a.session_id.clone(),
+                    vec!["first".into()],
+                ))
                 .await
                 .expect("prompt A should succeed");
             client_conn
-                .prompt(PromptRequest::new(session_b.session_id.clone(), vec!["second".into()]))
+                .prompt(PromptRequest::new(
+                    session_b.session_id.clone(),
+                    vec!["second".into()],
+                ))
                 .await
                 .expect("prompt B should succeed");
 
@@ -625,7 +787,8 @@ async fn list_sessions_filters_by_cwd_and_orders_by_recency() {
                 "cursor paging should return remaining sessions"
             );
             assert!(
-                paged.sessions
+                paged
+                    .sessions
                     .iter()
                     .all(|s| s.session_id != all.sessions[0].session_id),
                 "offset cursor should skip first most-recent entry"
@@ -682,12 +845,18 @@ async fn ask_mode_disables_force_and_agent_mode_enables_it() {
             client.notifications.lock().unwrap().clear();
 
             client_conn
-                .set_session_mode(SetSessionModeRequest::new(session.session_id.clone(), "agent"))
+                .set_session_mode(SetSessionModeRequest::new(
+                    session.session_id.clone(),
+                    "agent",
+                ))
                 .await
                 .expect("set_session_mode should succeed");
 
             client_conn
-                .prompt(PromptRequest::new(session.session_id, vec!["hello again".into()]))
+                .prompt(PromptRequest::new(
+                    session.session_id,
+                    vec!["hello again".into()],
+                ))
                 .await
                 .expect("agent mode prompt should succeed");
 
@@ -830,7 +999,10 @@ async fn ask_and_plan_send_mode_flag_but_agent_omits_it() {
                 .await
                 .expect("set_session_mode plan should succeed");
             client_conn
-                .prompt(PromptRequest::new(session_id.clone(), vec!["plan please".into()]))
+                .prompt(PromptRequest::new(
+                    session_id.clone(),
+                    vec!["plan please".into()],
+                ))
                 .await
                 .expect("plan mode prompt should succeed");
             for _ in 0..6 {
@@ -938,7 +1110,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .expect("ask scenario new session should succeed")
                 .session_id;
             client_conn
-                .prompt(PromptRequest::new(ask_session.clone(), vec!["start ask".into()]))
+                .prompt(PromptRequest::new(
+                    ask_session.clone(),
+                    vec!["start ask".into()],
+                ))
                 .await
                 .expect("ask prompt should succeed");
             for _ in 0..6 {
@@ -952,7 +1127,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .await
                 .expect("switch ask->plan should succeed");
             client_conn
-                .prompt(PromptRequest::new(ask_session.clone(), vec!["ask to plan".into()]))
+                .prompt(PromptRequest::new(
+                    ask_session.clone(),
+                    vec!["ask to plan".into()],
+                ))
                 .await
                 .expect("plan prompt should succeed");
             for _ in 0..6 {
@@ -986,7 +1164,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .await
                 .expect("set start plan should succeed");
             client_conn
-                .prompt(PromptRequest::new(plan_session.clone(), vec!["start plan".into()]))
+                .prompt(PromptRequest::new(
+                    plan_session.clone(),
+                    vec!["start plan".into()],
+                ))
                 .await
                 .expect("plan start prompt should succeed");
             for _ in 0..6 {
@@ -1000,7 +1181,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .await
                 .expect("switch plan->ask should succeed");
             client_conn
-                .prompt(PromptRequest::new(plan_session.clone(), vec!["plan to ask".into()]))
+                .prompt(PromptRequest::new(
+                    plan_session.clone(),
+                    vec!["plan to ask".into()],
+                ))
                 .await
                 .expect("ask prompt should succeed");
             for _ in 0..6 {
@@ -1014,7 +1198,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .await
                 .expect("switch plan->agent should succeed");
             client_conn
-                .prompt(PromptRequest::new(plan_session, vec!["plan to agent".into()]))
+                .prompt(PromptRequest::new(
+                    plan_session,
+                    vec!["plan to agent".into()],
+                ))
                 .await
                 .expect("agent prompt should succeed");
             for _ in 0..6 {
@@ -1034,7 +1221,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .await
                 .expect("set start agent should succeed");
             client_conn
-                .prompt(PromptRequest::new(agent_session.clone(), vec!["start agent".into()]))
+                .prompt(PromptRequest::new(
+                    agent_session.clone(),
+                    vec!["start agent".into()],
+                ))
                 .await
                 .expect("agent start prompt should succeed");
             for _ in 0..6 {
@@ -1048,7 +1238,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .await
                 .expect("switch agent->ask should succeed");
             client_conn
-                .prompt(PromptRequest::new(agent_session.clone(), vec!["agent to ask".into()]))
+                .prompt(PromptRequest::new(
+                    agent_session.clone(),
+                    vec!["agent to ask".into()],
+                ))
                 .await
                 .expect("ask prompt should succeed");
             for _ in 0..6 {
@@ -1062,7 +1255,10 @@ async fn mode_transition_matrix_behaves_as_expected() {
                 .await
                 .expect("switch ask->agent again should succeed");
             client_conn
-                .prompt(PromptRequest::new(agent_session, vec!["agent again".into()]))
+                .prompt(PromptRequest::new(
+                    agent_session,
+                    vec!["agent again".into()],
+                ))
                 .await
                 .expect("agent prompt should succeed");
             for _ in 0..6 {

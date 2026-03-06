@@ -4,18 +4,18 @@ use crate::error::ErrorKind;
 use crate::prompt::PromptEngine;
 use crate::session::{SessionState, SessionStore};
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, ContentBlock, Error, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionCapabilities, SessionConfigOption, CurrentModeUpdate,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionInfo, SessionInfoUpdate,
-    SessionListCapabilities, SessionConfigKind, SessionNotification, SessionUpdate, ContentChunk,
-    Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
+    CancelNotification, Client, ClientCapabilities, ContentBlock, ContentChunk, CurrentModeUpdate,
+    Error, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
+    NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
+    SessionConfigKind, SessionConfigOption, SessionConfigSelectOption, SessionConfigSelectOptions,
+    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, Client, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields, AgentSideConnection,
-    ToolCallStatus, UsageUpdate, WriteTextFileRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, ToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    UsageUpdate, WriteTextFileRequest,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -106,11 +106,9 @@ impl CursorAcpAgent {
 
     fn event_to_session_update(event: &crate::cli::CursorCliEvent) -> Option<SessionUpdate> {
         match event {
-            crate::cli::CursorCliEvent::AssistantDelta(text) => {
-                Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                    text.clone().into(),
-                )))
-            }
+            crate::cli::CursorCliEvent::AssistantDelta(text) => Some(
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(text.clone().into())),
+            ),
             crate::cli::CursorCliEvent::ThinkingDelta(text) => Some(
                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(text.clone().into())),
             ),
@@ -167,9 +165,9 @@ impl CursorAcpAgent {
                         || message_implies_edit)
                 {
                     tool_call.locations.first().and_then(|path| {
-                        std::fs::read_to_string(path)
-                            .ok()
-                            .map(|new_text| agent_client_protocol::Diff::new(path.clone(), new_text))
+                        std::fs::read_to_string(path).ok().map(|new_text| {
+                            agent_client_protocol::Diff::new(path.clone(), new_text)
+                        })
                     })
                 } else {
                     None
@@ -236,7 +234,12 @@ impl CursorAcpAgent {
     }
 
     fn cwd_from_meta(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<PathBuf> {
-        let keys = ["cwd", "working_directory", "workspace_root", "workspaceRoot"];
+        let keys = [
+            "cwd",
+            "working_directory",
+            "workspace_root",
+            "workspaceRoot",
+        ];
         for key in keys {
             let value = meta
                 .and_then(|meta| meta.get(key))
@@ -325,7 +328,10 @@ impl CursorAcpAgent {
         if trimmed.chars().count() <= MAX_CHARS {
             return Some(trimmed.to_string());
         }
-        let mut out = trimmed.chars().take(MAX_CHARS.saturating_sub(3)).collect::<String>();
+        let mut out = trimmed
+            .chars()
+            .take(MAX_CHARS.saturating_sub(3))
+            .collect::<String>();
         out.push_str("...");
         Some(out)
     }
@@ -337,7 +343,9 @@ impl CursorAcpAgent {
         !matches!(raw.as_str(), "0" | "false" | "off" | "no")
     }
 
-    fn serialize_session_updates_for_history(updates: Vec<SessionUpdate>) -> Vec<serde_json::Value> {
+    fn serialize_session_updates_for_history(
+        updates: Vec<SessionUpdate>,
+    ) -> Vec<serde_json::Value> {
         updates
             .into_iter()
             .filter_map(|update| serde_json::to_value(update).ok())
@@ -430,8 +438,7 @@ impl Agent for CursorAcpAgent {
         Ok(InitializeResponse::new(ProtocolVersion::V1)
             .agent_capabilities(capabilities)
             .agent_info(
-                Implementation::new("cursor-acp", env!("CARGO_PKG_VERSION"))
-                    .title("Cursor ACP"),
+                Implementation::new("cursor-acp", env!("CARGO_PKG_VERSION")).title("Cursor ACP"),
             )
             .auth_methods(vec![terminal_auth_method(&binary)]))
     }
@@ -445,7 +452,11 @@ impl Agent for CursorAcpAgent {
             error.message = format!("Unsupported auth method: {}", request.method_id);
             return Err(error);
         }
-        let auth = self.cli_runtime.check_auth().await.map_err(Self::map_error)?;
+        let auth = self
+            .cli_runtime
+            .check_auth()
+            .await
+            .map_err(Self::map_error)?;
         if !auth.authenticated {
             return Err(Error::auth_required().data(serde_json::json!({
                 "reason": "auth_required",
@@ -457,12 +468,16 @@ impl Agent for CursorAcpAgent {
     }
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        let workspace_trusted = Self::workspace_trusted_from_meta(request.meta.as_ref()).unwrap_or(true);
+        let workspace_trusted =
+            Self::workspace_trusted_from_meta(request.meta.as_ref()).unwrap_or(true);
         let cwd = request.cwd;
         let listed_models = self.cli_runtime.list_models().await.ok();
         let mut store = self.session_store.lock().unwrap();
         let session = store.create_session(cwd, workspace_trusted);
-        self.edit_enabled_sessions.lock().unwrap().remove(&session.id);
+        self.edit_enabled_sessions
+            .lock()
+            .unwrap()
+            .remove(&session.id);
 
         if let Some(model_ids) = listed_models {
             store.update_models(model_ids);
@@ -497,7 +512,10 @@ impl Agent for CursorAcpAgent {
                     session = updated.clone();
                 }
             }
-            self.edit_enabled_sessions.lock().unwrap().remove(&session.id);
+            self.edit_enabled_sessions
+                .lock()
+                .unwrap()
+                .remove(&session.id);
             (
                 store.mode_state(&session),
                 store.model_state(&session),
@@ -510,26 +528,25 @@ impl Agent for CursorAcpAgent {
         if replay_history_updates.is_empty() {
             for turn in replay_turns {
                 if !turn.user.trim().is_empty() {
-                    self
-                        .notify_session_update(
-                            session_id.clone(),
-                            SessionUpdate::UserMessageChunk(ContentChunk::new(turn.user.into())),
-                        )
-                        .await?;
+                    self.notify_session_update(
+                        session_id.clone(),
+                        SessionUpdate::UserMessageChunk(ContentChunk::new(turn.user.into())),
+                    )
+                    .await?;
                 }
                 if !turn.assistant.trim().is_empty() {
-                    self
-                        .notify_session_update(
-                            session_id.clone(),
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(turn.assistant.into())),
-                        )
-                        .await?;
+                    self.notify_session_update(
+                        session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(turn.assistant.into())),
+                    )
+                    .await?;
                 }
             }
         } else {
             for value in replay_history_updates {
                 if let Ok(update) = serde_json::from_value::<SessionUpdate>(value) {
-                    self.notify_session_update(session_id.clone(), update).await?;
+                    self.notify_session_update(session_id.clone(), update)
+                        .await?;
                 }
             }
         }
@@ -539,7 +556,10 @@ impl Agent for CursorAcpAgent {
             .models(Some(models)))
     }
 
-    async fn list_sessions(&self, request: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {
+    async fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, Error> {
         let store = self.session_store.lock().unwrap();
         let mut sessions = store.list_sessions();
         let filter_cwd = request
@@ -564,16 +584,13 @@ impl Agent for CursorAcpAgent {
 
         let mut infos = Vec::new();
         for session in sessions.into_iter().skip(start).take(end - start) {
-            let title = session
-                .title
-                .clone()
-                .or_else(|| {
-                    session
-                        .cwd
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| name.to_string())
-                });
+            let title = session.title.clone().or_else(|| {
+                session
+                    .cwd
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string())
+            });
             let updated_at = DateTime::<Utc>::from(session.updated_at).to_rfc3339();
             infos.push(
                 SessionInfo::new(session.id.clone(), session.cwd.clone())
@@ -619,21 +636,15 @@ impl Agent for CursorAcpAgent {
                 }
             };
             if should_notify {
-                let info_update = SessionUpdate::SessionInfoUpdate(
-                    SessionInfoUpdate::new().title(Some(title)),
-                );
+                let info_update =
+                    SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(Some(title)));
                 {
-                    let serialized = Self::serialize_session_updates_for_history(vec![
-                        info_update.clone(),
-                    ]);
+                    let serialized =
+                        Self::serialize_session_updates_for_history(vec![info_update.clone()]);
                     let mut store = self.session_store.lock().unwrap();
                     store.append_history_updates(&session_id, serialized);
                 }
-                self
-                    .notify_session_update(
-                        session_id.clone(),
-                        info_update,
-                    )
+                self.notify_session_update(session_id.clone(), info_update)
                     .await?;
             }
         }
@@ -700,8 +711,7 @@ impl Agent for CursorAcpAgent {
                                 .session_notification(SessionNotification::new(
                                     notify_session_id.clone(),
                                     SessionUpdate::UsageUpdate(UsageUpdate::new(
-                                        usage.used,
-                                        usage.size,
+                                        usage.used, usage.size,
                                     )),
                                 ))
                                 .await?;
@@ -723,12 +733,12 @@ impl Agent for CursorAcpAgent {
                     Some(event_tx),
                 )
                 .await;
-            let notify_result = notify_task
-                .await
-                .map_err(|error| Error::internal_error().data(serde_json::json!({
+            let notify_result = notify_task.await.map_err(|error| {
+                Error::internal_error().data(serde_json::json!({
                     "reason": "stream_notify_join_failed",
                     "detail": error.to_string(),
-                })))?;
+                }))
+            })?;
             notify_result?;
 
             if let Ok((events, stop_reason)) = &streamed {
@@ -747,8 +757,10 @@ impl Agent for CursorAcpAgent {
                         assistant_output.push_str(text);
                     }
                     if let crate::cli::CursorCliEvent::Result(result) = event
-                        && let Some(resume_id) =
-                            result.meta.get("session_id").and_then(serde_json::Value::as_str)
+                        && let Some(resume_id) = result
+                            .meta
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_str)
                     {
                         let mut store = self.session_store.lock().unwrap();
                         store.set_resume_id(&session_id, Some(resume_id.to_string()));
@@ -757,8 +769,7 @@ impl Agent for CursorAcpAgent {
                         }
                         if let Some(usage) = result.usage {
                             persisted_updates.push(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                                usage.used,
-                                usage.size,
+                                usage.used, usage.size,
                             )));
                         }
                     }
@@ -786,15 +797,13 @@ impl Agent for CursorAcpAgent {
                 .map_err(Self::map_error)?;
             if let Some(usage) = result.usage {
                 persisted_updates.push(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                    usage.used,
-                    usage.size,
+                    usage.used, usage.size,
                 )));
-                self
-                    .notify_session_update(
-                        session_id.clone(),
-                        SessionUpdate::UsageUpdate(UsageUpdate::new(usage.used, usage.size)),
-                    )
-                    .await?;
+                self.notify_session_update(
+                    session_id.clone(),
+                    SessionUpdate::UsageUpdate(UsageUpdate::new(usage.used, usage.size)),
+                )
+                .await?;
             }
             Ok((result.text, stop_reason))
         };
@@ -816,12 +825,11 @@ impl Agent for CursorAcpAgent {
                     store.append_turn(&session_id, prompt_text.clone(), text.clone());
                 }
                 if !text.is_empty() {
-                    self
-                        .notify_session_update(
-                            session_id,
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
-                        )
-                        .await?;
+                    self.notify_session_update(
+                        session_id,
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
+                    )
+                    .await?;
                     Ok(PromptResponse::new(stop_reason))
                 } else {
                     Ok(PromptResponse::new(stop_reason))
@@ -837,11 +845,7 @@ impl Agent for CursorAcpAgent {
                 let serialized = Self::serialize_session_updates_for_history(persisted_updates);
                 let mut store = self.session_store.lock().unwrap();
                 store.append_history_updates(&session.id, serialized);
-                self
-                    .notify_session_update(
-                        session.id.clone(),
-                        failure_update,
-                    )
+                self.notify_session_update(session.id.clone(), failure_update)
                     .await?;
                 Ok(PromptResponse::new(stop_reason))
             }
@@ -875,12 +879,11 @@ impl Agent for CursorAcpAgent {
             }
         }
 
-        self
-            .notify_session_update(
-                request.session_id.clone(),
-                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id.clone())),
-            )
-            .await?;
+        self.notify_session_update(
+            request.session_id.clone(),
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id.clone())),
+        )
+        .await?;
         {
             let serialized = Self::serialize_session_updates_for_history(vec![
                 SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id)),

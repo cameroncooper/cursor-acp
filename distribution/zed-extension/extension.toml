@@ -1,7 +1,7 @@
 id = "cursor-acp"
 name = "Cursor ACP"
 version = "0.1.0"
-schema_version = 0
+schema_version = 1
 description = "ACP adapter for Cursor headless CLI"
 repository = "https://github.com/cameroncooper/cursor-acp"
 authors = ["Cursor ACP Contributors"]
