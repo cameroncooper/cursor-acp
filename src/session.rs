@@ -236,7 +236,10 @@ impl SessionStore {
             .iter()
             .map(|model| model.model_id.to_string())
             .collect();
-        if !available.iter().any(|candidate| candidate == model_id.0.as_ref()) {
+        if !available
+            .iter()
+            .any(|candidate| candidate == model_id.0.as_ref())
+        {
             return Err(available);
         }
         if let Some(session) = self.sessions.get_mut(session_id) {

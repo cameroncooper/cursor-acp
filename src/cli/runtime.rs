@@ -50,12 +50,24 @@ pub struct CursorUsageUpdate {
 }
 
 #[derive(Debug, Clone)]
+pub struct CursorPromptRequest {
+    pub prompt: String,
+    pub mode: Option<String>,
+    pub sandbox: Option<String>,
+    pub model: Option<String>,
+    pub resume: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub allow_edits: bool,
+    pub trust_workspace: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum CursorCliEvent {
     AssistantDelta(String),
     ThinkingDelta(String),
     System { message: String, raw: Value },
     ToolCallStart(CursorCliToolCall),
-    ToolCallUpdate(CursorCliToolCallUpdate),
+    ToolCallUpdate(Box<CursorCliToolCallUpdate>),
     Result(CursorPromptResult),
     Other(Value),
 }
@@ -128,56 +140,20 @@ impl CursorCliRuntime {
 
     pub async fn run_prompt_json(
         &self,
-        prompt: String,
-        mode: Option<String>,
-        sandbox: Option<String>,
-        model: Option<String>,
-        resume: Option<String>,
-        cwd: Option<PathBuf>,
-        allow_edits: bool,
-        trust_workspace: bool,
+        request: CursorPromptRequest,
     ) -> Result<CursorPromptResult, ErrorKind> {
-        let mut args = vec![
-            "-p".to_string(),
-            "--output-format".to_string(),
-            "json".to_string(),
-        ];
-        if allow_edits {
-            args.push("--force".to_string());
-        }
-        if trust_workspace {
-            args.push("--trust".to_string());
-        }
-        if let Some(mode_id) = mode {
-            args.push("--mode".to_string());
-            args.push(mode_id);
-        }
-        if let Some(sandbox_mode) = sandbox {
-            args.push("--sandbox".to_string());
-            args.push(sandbox_mode);
-        }
-        if let Some(model_id) = model {
-            args.push("--model".to_string());
-            args.push(model_id);
-        }
-        if let Some(resume_id) = resume {
-            args.push("--resume".to_string());
-            args.push(resume_id);
-        }
-        args.push(prompt);
-
-        let output = self.run_command(args, cwd).await?;
-        let parsed: Value = serde_json::from_str(&output.stdout).map_err(|_| {
-            ErrorKind::CliProtocolViolation {
+        let args = Self::build_prompt_args(&request, "json", false);
+        let output = self.run_command(args, request.cwd).await?;
+        let parsed: Value =
+            serde_json::from_str(&output.stdout).map_err(|_| ErrorKind::CliProtocolViolation {
                 parser_phase: "json_prompt",
                 raw_excerpt: output.stdout.chars().take(600).collect(),
-            }
-        })?;
+            })?;
 
         let text = parsed
             .get("result")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| output.stdout.as_str())
+            .unwrap_or(output.stdout.as_str())
             .to_string();
 
         let usage = extract_usage_update(&parsed);
@@ -190,49 +166,13 @@ impl CursorCliRuntime {
 
     pub async fn run_prompt_stream(
         &self,
-        prompt: String,
-        mode: Option<String>,
-        sandbox: Option<String>,
-        model: Option<String>,
-        resume: Option<String>,
-        cwd: Option<PathBuf>,
-        allow_edits: bool,
-        trust_workspace: bool,
+        request: CursorPromptRequest,
         event_tx: Option<UnboundedSender<CursorCliEvent>>,
     ) -> Result<Vec<CursorCliEvent>, ErrorKind> {
-        let mut args = vec![
-            "-p".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--stream-partial-output".to_string(),
-        ];
-        if allow_edits {
-            args.push("--force".to_string());
-        }
-        if trust_workspace {
-            args.push("--trust".to_string());
-        }
-        if let Some(mode_id) = mode {
-            args.push("--mode".to_string());
-            args.push(mode_id);
-        }
-        if let Some(sandbox_mode) = sandbox {
-            args.push("--sandbox".to_string());
-            args.push(sandbox_mode);
-        }
-        if let Some(model_id) = model {
-            args.push("--model".to_string());
-            args.push(model_id);
-        }
-        if let Some(resume_id) = resume {
-            args.push("--resume".to_string());
-            args.push(resume_id);
-        }
-        args.push(prompt);
-
+        let args = Self::build_prompt_args(&request, "stream-json", true);
         let mut command = Command::new(&self.config.binary);
         command.args(args);
-        if let Some(path) = cwd {
+        if let Some(path) = request.cwd {
             command.current_dir(path);
         }
         command.stdin(Stdio::null());
@@ -256,16 +196,21 @@ impl CursorCliRuntime {
             .await
             .map_err(|error| ErrorKind::TransientIo(error.to_string()))?
         {
-            let parsed: Value = serde_json::from_str(&line).map_err(|_| {
-                ErrorKind::CliProtocolViolation {
+            let parsed: Value =
+                serde_json::from_str(&line).map_err(|_| ErrorKind::CliProtocolViolation {
                     parser_phase: "stream_json",
                     raw_excerpt: line.chars().take(400).collect(),
-                }
-            })?;
+                })?;
 
-            let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or_default();
+            let event_type = parsed
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let normalized_event_type = normalize_event_type(event_type);
-            let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or_default();
+            let subtype = parsed
+                .get("subtype")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let has_tool_payload = looks_like_tool_event(&parsed);
 
             let emit = |event: CursorCliEvent, events: &mut Vec<CursorCliEvent>| {
@@ -323,9 +268,7 @@ impl CursorCliRuntime {
                 }
                 "system" => {
                     let message = extract_system_message(&parsed, subtype);
-                    if !message.trim().is_empty()
-                        && message != "System: init"
-                        && message != "init"
+                    if !message.trim().is_empty() && message != "System: init" && message != "init"
                     {
                         emit(
                             CursorCliEvent::System {
@@ -338,8 +281,10 @@ impl CursorCliRuntime {
                 }
                 "user" => {}
                 "result" => {
-                    let text =
-                        dedupe_result_text_for_stream(&assistant_streamed_text, extract_result_text(&parsed));
+                    let text = dedupe_result_text_for_stream(
+                        &assistant_streamed_text,
+                        extract_result_text(&parsed),
+                    );
                     let should_stream_result = !text.trim().is_empty();
                     let usage = extract_usage_update(&parsed);
                     let result_event = CursorCliEvent::Result(CursorPromptResult {
@@ -356,7 +301,11 @@ impl CursorCliRuntime {
                     if has_tool_payload {
                         for event in parse_tool_call_events(
                             &parsed,
-                            if subtype.is_empty() { "started" } else { subtype },
+                            if subtype.is_empty() {
+                                "started"
+                            } else {
+                                subtype
+                            },
                             &mut seen_tool_calls,
                         ) {
                             emit(event, &mut events);
@@ -380,10 +329,46 @@ impl CursorCliRuntime {
         Ok(events)
     }
 
-    pub(crate) fn classify_cli_failure(
-        exit_code: Option<i32>,
-        stderr: &str,
-    ) -> Option<ErrorKind> {
+    fn build_prompt_args(
+        request: &CursorPromptRequest,
+        output_format: &str,
+        stream_partial_output: bool,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            output_format.to_string(),
+        ];
+        if stream_partial_output {
+            args.push("--stream-partial-output".to_string());
+        }
+        if request.allow_edits {
+            args.push("--force".to_string());
+        }
+        if request.trust_workspace {
+            args.push("--trust".to_string());
+        }
+        if let Some(mode_id) = request.mode.as_ref() {
+            args.push("--mode".to_string());
+            args.push(mode_id.clone());
+        }
+        if let Some(sandbox_mode) = request.sandbox.as_ref() {
+            args.push("--sandbox".to_string());
+            args.push(sandbox_mode.clone());
+        }
+        if let Some(model_id) = request.model.as_ref() {
+            args.push("--model".to_string());
+            args.push(model_id.clone());
+        }
+        if let Some(resume_id) = request.resume.as_ref() {
+            args.push("--resume".to_string());
+            args.push(resume_id.clone());
+        }
+        args.push(request.prompt.clone());
+        args
+    }
+
+    pub(crate) fn classify_cli_failure(exit_code: Option<i32>, stderr: &str) -> Option<ErrorKind> {
         let lower = stderr.to_lowercase();
         if lower.contains("cannot use this model") || lower.contains("available models") {
             return Some(parse_model_unsupported(stderr));
@@ -438,10 +423,7 @@ impl CursorCliRuntime {
             });
         }
 
-        Ok(CommandOutput {
-            stdout,
-            stderr,
-        })
+        Ok(CommandOutput { stdout, stderr })
     }
 }
 
@@ -452,7 +434,8 @@ fn normalize_text_for_dedupe(text: &str) -> String {
 fn dedupe_result_text_for_stream(streamed_text: &str, final_text: String) -> String {
     let streamed = normalize_text_for_dedupe(streamed_text);
     let normalized_final = normalize_text_for_dedupe(&final_text);
-    let streamed_contains_final = !normalized_final.is_empty() && streamed.contains(&normalized_final);
+    let streamed_contains_final =
+        !normalized_final.is_empty() && streamed.contains(&normalized_final);
     let final_contains_streamed = !streamed.is_empty() && normalized_final.contains(&streamed);
     let near_match = streamed_contains_final
         || normalized_final == streamed
@@ -484,10 +467,11 @@ fn extract_assistant_deltas(parsed: &Value) -> Vec<String> {
         parsed.get("delta"),
         parsed.pointer("/message/content"),
         parsed.pointer("/message/delta"),
-    ] {
-        if let Some(candidate) = candidate {
-            collect_text_chunks(candidate, &mut chunks);
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        collect_text_chunks(candidate, &mut chunks);
     }
 
     if chunks.is_empty() {
@@ -531,19 +515,21 @@ fn parse_tool_call_events(
         }));
     }
 
-    events.push(CursorCliEvent::ToolCallUpdate(CursorCliToolCallUpdate {
-        tool_call_id,
-        kind: descriptor.kind,
-        status: map_tool_status(subtype),
-        title: Some(descriptor.title),
-        locations: descriptor.locations,
-        message: descriptor.message,
-        raw_input: descriptor.raw_input,
-        raw_output: descriptor.raw_output,
-        diff: descriptor.diff,
-        managed_write_text: descriptor.managed_write_text,
-        todo_items: descriptor.todo_items,
-    }));
+    events.push(CursorCliEvent::ToolCallUpdate(Box::new(
+        CursorCliToolCallUpdate {
+            tool_call_id,
+            kind: descriptor.kind,
+            status: map_tool_status(subtype),
+            title: Some(descriptor.title),
+            locations: descriptor.locations,
+            message: descriptor.message,
+            raw_input: descriptor.raw_input,
+            raw_output: descriptor.raw_output,
+            diff: descriptor.diff,
+            managed_write_text: descriptor.managed_write_text,
+            todo_items: descriptor.todo_items,
+        },
+    )));
 
     events
 }
@@ -674,7 +660,8 @@ fn extract_tool_call_descriptor(parsed: &Value) -> ToolCallDescriptor {
     let diff = build_diff_from_tool_payload(&tool_key, raw_input.as_ref(), raw_output.as_ref());
     let managed_write_text =
         managed_write_text_from_tool_payload(&tool_key, raw_input.as_ref(), raw_output.as_ref());
-    let todo_items = todo_items_from_tool_payload(&tool_key, raw_input.as_ref(), raw_output.as_ref());
+    let todo_items =
+        todo_items_from_tool_payload(&tool_key, raw_input.as_ref(), raw_output.as_ref());
 
     ToolCallDescriptor {
         tool_call_id,
@@ -888,7 +875,11 @@ fn todo_items_from_tool_payload(
         .and_then(|value| value.get("success"))
         .and_then(|value| value.get("todos"))
         .and_then(Value::as_array)
-        .or_else(|| raw_input.and_then(|value| value.get("todos")).and_then(Value::as_array))?;
+        .or_else(|| {
+            raw_input
+                .and_then(|value| value.get("todos"))
+                .and_then(Value::as_array)
+        })?;
     let mut items = Vec::new();
     for todo in todos {
         let content = todo
@@ -937,16 +928,25 @@ fn shell_output_message(
     if let Some(command) = command
         && !command.trim().is_empty()
     {
-        parts.push(format!("Command: `{}`", truncate_for_title(command.trim(), 160)));
+        parts.push(format!(
+            "Command: `{}`",
+            truncate_for_title(command.trim(), 160)
+        ));
     }
     if let Some(exit_code) = exit_code {
         parts.push(format!("Exit code: {exit_code}"));
     }
     if !stdout.trim().is_empty() {
-        parts.push(format!("stdout:\n```sh\n{}\n```", truncate_output(stdout, 3000)));
+        parts.push(format!(
+            "stdout:\n```sh\n{}\n```",
+            truncate_output(stdout, 3000)
+        ));
     }
     if !stderr.trim().is_empty() {
-        parts.push(format!("stderr:\n```sh\n{}\n```", truncate_output(stderr, 3000)));
+        parts.push(format!(
+            "stderr:\n```sh\n{}\n```",
+            truncate_output(stderr, 3000)
+        ));
     }
     if parts.is_empty() {
         None
@@ -959,7 +959,10 @@ fn truncate_for_title(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let mut out = text.chars().take(max_chars.saturating_sub(3)).collect::<String>();
+    let mut out = text
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
     out.push_str("...");
     out
 }
@@ -968,7 +971,10 @@ fn truncate_output(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let mut out = text.chars().take(max_chars.saturating_sub(19)).collect::<String>();
+    let mut out = text
+        .chars()
+        .take(max_chars.saturating_sub(19))
+        .collect::<String>();
     out.push_str("\n... [output truncated]");
     out
 }
@@ -1188,9 +1194,15 @@ mod tests {
 
         for line in input.lines().filter(|line| !line.trim().is_empty()) {
             let parsed: Value = serde_json::from_str(line).expect("fixture line should parse");
-            let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or_default();
+            let event_type = parsed
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let normalized_event_type = normalize_event_type(event_type);
-            let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or_default();
+            let subtype = parsed
+                .get("subtype")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let has_tool_payload = looks_like_tool_event(&parsed);
             match normalized_event_type.as_str() {
                 "assistant" => {
@@ -1223,7 +1235,11 @@ mod tests {
                     }
                 }
                 "tool_call" => {
-                    events.extend(parse_tool_call_events(&parsed, subtype, &mut seen_tool_calls));
+                    events.extend(parse_tool_call_events(
+                        &parsed,
+                        subtype,
+                        &mut seen_tool_calls,
+                    ));
                 }
                 "thinking" => {
                     let text = parsed
@@ -1238,9 +1254,7 @@ mod tests {
                 }
                 "system" => {
                     let message = extract_system_message(&parsed, subtype);
-                    if !message.trim().is_empty()
-                        && message != "System: init"
-                        && message != "init"
+                    if !message.trim().is_empty() && message != "System: init" && message != "init"
                     {
                         events.push(CursorCliEvent::System {
                             message,
@@ -1250,8 +1264,10 @@ mod tests {
                 }
                 "user" => {}
                 "result" => {
-                    let text =
-                        dedupe_result_text_for_stream(&assistant_streamed_text, extract_result_text(&parsed));
+                    let text = dedupe_result_text_for_stream(
+                        &assistant_streamed_text,
+                        extract_result_text(&parsed),
+                    );
                     let usage = extract_usage_update(&parsed);
                     events.push(CursorCliEvent::Result(CursorPromptResult {
                         text,
@@ -1263,7 +1279,11 @@ mod tests {
                     if has_tool_payload {
                         events.extend(parse_tool_call_events(
                             &parsed,
-                            if subtype.is_empty() { "started" } else { subtype },
+                            if subtype.is_empty() {
+                                "started"
+                            } else {
+                                subtype
+                            },
                             &mut seen_tool_calls,
                         ));
                     }
@@ -1366,7 +1386,7 @@ mod tests {
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         assert!(!events.is_empty());
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected ToolCallUpdate");
@@ -1419,7 +1439,7 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected ToolCallUpdate");
@@ -1449,13 +1469,16 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "started", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected ToolCallUpdate");
         assert_eq!(update.kind, ToolKind::Edit);
         assert!(update.locations.contains(&"/tmp/new.txt".to_string()));
-        assert!(update.diff.is_some(), "expected diff for top-level writeToolCall");
+        assert!(
+            update.diff.is_some(),
+            "expected diff for top-level writeToolCall"
+        );
     }
 
     #[test]
@@ -1511,7 +1534,10 @@ mod tests {
             .filter(|event| matches!(event, CursorCliEvent::ToolCallStart(_)))
             .count();
         assert_eq!(first_start_count, 1, "first parse should include start");
-        assert_eq!(second_start_count, 0, "duplicate parse should not include start");
+        assert_eq!(
+            second_start_count, 0,
+            "duplicate parse should not include start"
+        );
 
         let first_id = first_events.iter().find_map(|event| match event {
             CursorCliEvent::ToolCallUpdate(update) => Some(update.tool_call_id.clone()),
@@ -1544,7 +1570,10 @@ mod tests {
             _ => None,
         });
         let result = result.expect("expected result event");
-        assert!(result.text.is_empty(), "result text should be deduped against deltas");
+        assert!(
+            result.text.is_empty(),
+            "result text should be deduped against deltas"
+        );
         assert_eq!(result.usage.map(|usage| usage.used), Some(1500));
     }
 
@@ -1560,8 +1589,10 @@ mod tests {
         assert_eq!(start.title, "Run pwd && ls -1");
 
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) if update.status == ToolCallStatus::Completed => {
-                Some(update)
+            CursorCliEvent::ToolCallUpdate(update)
+                if update.status == ToolCallStatus::Completed =>
+            {
+                Some(*update)
             }
             _ => None,
         });
@@ -1573,14 +1604,15 @@ mod tests {
 
     #[test]
     fn replay_fixture_multi_file_edit_covers_nested_shapes() {
-        let events = replay_stream_json(&fixture("tests/fixtures/stream-json/multi_file_edit.jsonl"));
+        let events =
+            replay_stream_json(&fixture("tests/fixtures/stream-json/multi_file_edit.jsonl"));
         let completed_updates: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
                 CursorCliEvent::ToolCallUpdate(update)
                     if update.status == ToolCallStatus::Completed =>
                 {
-                    Some(update)
+                    Some(update.as_ref())
                 }
                 _ => None,
             })
@@ -1592,9 +1624,11 @@ mod tests {
     #[test]
     fn replay_fixture_plan_like_emits_thinking_and_suppresses_init_system() {
         let events = replay_stream_json(&fixture("tests/fixtures/stream-json/plan_like.jsonl"));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, CursorCliEvent::ThinkingDelta(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CursorCliEvent::ThinkingDelta(_)))
+        );
         assert!(!events.iter().any(|event| {
             matches!(
                 event,
@@ -1619,7 +1653,7 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected tool update");
@@ -1660,7 +1694,7 @@ mod tests {
         let mut seen = HashSet::new();
         let events = parse_tool_call_events(&parsed, "completed", &mut seen);
         let update = events.into_iter().find_map(|event| match event {
-            CursorCliEvent::ToolCallUpdate(update) => Some(update),
+            CursorCliEvent::ToolCallUpdate(update) => Some(*update),
             _ => None,
         });
         let update = update.expect("expected tool update");
@@ -1710,7 +1744,10 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, CursorCliEvent::AssistantDelta(_)))
             .count();
-        assert_eq!(assistant_chunks, 1, "duplicate large chunk should be suppressed");
+        assert_eq!(
+            assistant_chunks, 1,
+            "duplicate large chunk should be suppressed"
+        );
     }
 
     #[test]
@@ -1737,11 +1774,19 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(assistant_chunks.len(), 2, "only partial chunks should remain");
+        assert_eq!(
+            assistant_chunks.len(),
+            2,
+            "only partial chunks should remain"
+        );
         let result_text = events.into_iter().find_map(|event| match event {
             CursorCliEvent::Result(result) => Some(result.text),
             _ => None,
         });
-        assert_eq!(result_text.as_deref(), Some(""), "duplicate final result should be suppressed");
+        assert_eq!(
+            result_text.as_deref(),
+            Some(""),
+            "duplicate final result should be suppressed"
+        );
     }
 }

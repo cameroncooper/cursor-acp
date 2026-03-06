@@ -26,9 +26,10 @@ pub async fn run_main() -> IoResult<()> {
 
     LocalSet::new()
         .run_until(async move {
-            let (connection, io_task) = AgentSideConnection::new(agent.clone(), stdout, stdin, |fut| {
-                tokio::task::spawn_local(fut);
-            });
+            let (connection, io_task) =
+                AgentSideConnection::new(agent.clone(), stdout, stdin, |fut| {
+                    tokio::task::spawn_local(fut);
+                });
             agent.attach_connection(Arc::new(connection));
 
             io_task
