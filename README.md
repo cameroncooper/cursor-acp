@@ -1,29 +1,30 @@
 # cursor-acp
 
-ACP adapter that lets [Zed](https://zed.dev) (and other ACP clients) use the [Cursor](https://cursor.com) agent.
+A thin ACP proxy that wraps Cursor's native `agent acp` server, adding session persistence, a Plan UI, and edit tracking to make Cursor work as a first-class agent in [Zed](https://zed.dev) and other [ACP](https://agentclientprotocol.com) clients.
 
-`cursor-acp` speaks the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over stdio and delegates to the Cursor headless CLI (`cursor-agent`).
+## Why a proxy?
+
+Cursor ships a built-in ACP server (`cursor-agent acp`) that handles modes, auth, streaming, tool calls, and permissions natively. But it doesn't provide everything an editor like Zed needs for a polished experience — there's no session history, the todo list uses a custom protocol Zed can't display, and file edits bypass Zed's review UI. This proxy sits between the editor and `agent acp`, forwarding everything transparently while filling in those gaps.
 
 ## Features
 
-- Full ACP agent lifecycle: initialize, authenticate, sessions (create / load / list / resume), prompt
-- Real-time streaming of assistant messages, thinking, tool calls, diffs, shell output, and plans
-- Mode enforcement: **Ask** and **Plan** modes are sandboxed read-only; **Agent** mode allows edits
-- Managed edits: file changes routed through the client for native accept/reject review UI
-- Session persistence with full event history replay
-- Token usage reporting (`UsageUpdate`) and live session title updates (`SessionInfoUpdate`)
-- Typed error handling for auth, unsupported models, workspace trust, and CLI failures
+- **Session persistence** — sessions are stored locally so you can browse, reload, and continue past conversations. Sessions are listed with titles, timestamps, and full event history replay.
+- **Plan UI** — Cursor's `_cursor/update_todos` requests and `createPlan`/`updateTodos` tool calls are translated into standard ACP Plan entries that Zed renders natively with status tracking.
+- **Edit tracking** — file edits made by Cursor are routed through Zed's `fs/write_text_file` mechanism, populating the ActionLog so the "Edits" panel shows changed files with accept/reject controls.
+- **Model selection** — available models are fetched from Cursor CLI and injected into session responses. Switching models restarts the agent process transparently.
+- **Session ID remapping** — after model switches or session loads, the proxy keeps Zed's session ID in sync with the child process so updates, file operations, and permissions all route correctly.
+- **Transparent proxy** — all other ACP messages pass through untouched.
 
 ## Requirements
 
-- [Cursor](https://cursor.com) installed (provides `cursor-agent`)
+- [Cursor CLI](https://cursor.com) installed (provides `cursor-agent` / `agent`)
 - Rust stable (if building from source)
 
 ## Install
 
 ### Option A: Download a release binary
 
-Download the archive for your platform from [GitHub Releases](https://github.com/cameroncooper/cursor-acp/releases), extract it, and place `cursor-acp` on your `PATH`.
+Grab the archive for your platform from [GitHub Releases](https://github.com/cameroncooper/cursor-acp/releases), extract it, and place `cursor-acp` on your `PATH`.
 
 ### Option B: Build from source
 
@@ -31,22 +32,14 @@ Download the archive for your platform from [GitHub Releases](https://github.com
 cargo install --git https://github.com/cameroncooper/cursor-acp --locked
 ```
 
-Or clone and build locally:
-
-```bash
-git clone https://github.com/cameroncooper/cursor-acp.git
-cd cursor-acp
-cargo install --path . --locked
-```
-
 ## Use with Zed
 
 ### 1. Ensure `cursor-agent` is available
 
-`cursor-acp` launches `cursor-agent`. Either:
+`cursor-acp` spawns `cursor-agent acp`. Either:
 
-- have `cursor-agent` on your `PATH`, or
-- set `CURSOR_AGENT_BIN` to the full path in the Zed config below.
+- have `cursor-agent` (or `agent`) on your `PATH`, or
+- set `CURSOR_AGENT_BIN` to the full path.
 
 ### 2. Add a custom agent in Zed settings
 
@@ -55,13 +48,11 @@ Open Zed settings (`cmd+,` → JSON) and add:
 ```json
 {
   "agent_servers": {
-    "cursor-acp": {
+    "Cursor CLI": {
       "type": "custom",
       "command": "cursor-acp",
       "args": [],
-      "env": {
-        "RUST_LOG": "info"
-      }
+      "env": {}
     }
   }
 }
@@ -72,13 +63,12 @@ If `cursor-agent` is not on `PATH`:
 ```json
 {
   "agent_servers": {
-    "cursor-acp": {
+    "Cursor CLI": {
       "type": "custom",
       "command": "cursor-acp",
       "args": [],
       "env": {
-        "CURSOR_AGENT_BIN": "/absolute/path/to/cursor-agent",
-        "RUST_LOG": "info"
+        "CURSOR_AGENT_BIN": "/absolute/path/to/cursor-agent"
       }
     }
   }
@@ -88,57 +78,45 @@ If `cursor-agent` is not on `PATH`:
 ### 3. Start a thread
 
 1. Open the Agent panel in Zed.
-2. Click **+** and select **cursor-acp**.
-3. If prompted, authenticate by running `cursor-agent login` in your terminal.
-
-### Optional: keybinding
-
-```json
-[
-  {
-    "bindings": {
-      "cmd-alt-r": [
-        "agent::NewExternalAgentThread",
-        { "agent": { "custom": { "name": "cursor-acp" } } }
-      ]
-    }
-  }
-]
-```
+2. Click **+** and select **Cursor CLI**.
+3. If prompted, authenticate by running `cursor-agent login` (or `agent login`) in your terminal.
 
 ### Debugging
 
 Use the command palette: **dev: open acp logs** to inspect ACP traffic.
-
-## Modes
-
-| Mode    | Behavior |
-|---------|----------|
-| Agent   | Full read/write access, tool execution |
-| Plan    | Read-only, planning and analysis only |
-| Ask     | Read-only, Q&A and explanations only |
-
-Ask and Plan modes pass `--mode` and `--sandbox enabled` to `cursor-agent`, preventing any file writes.
+Set `RUST_LOG=debug` in the env config for proxy-level logging.
 
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `CURSOR_AGENT_BIN` | Path to `cursor-agent` binary |
+| `CURSOR_AGENT_BIN` | Path to `cursor-agent` binary (default: `cursor-agent`) |
 | `CURSOR_AGENT_PATH` | Fallback if `CURSOR_AGENT_BIN` is not set |
-| `CURSOR_ACP_MANAGED_EDITS` | Enable managed edits for client-side review UI (default: `1`) |
-| `CURSOR_ACP_SESSIONS_FILE` | Custom path for session persistence file |
 | `RUST_LOG` | Tracing level filter (`debug`, `info`, `warn`) |
+| `CURSOR_ACP_SESSIONS_FILE` | Custom path for the session index (default: `~/.cursor/cursor-acp/sessions.json`) |
+
+## Architecture
+
+```
+Zed (stdin/stdout) ←→ cursor-acp proxy ←→ cursor-agent acp (child process)
+                         │
+                         ├── session/list, session/load → local session store
+                         ├── tool_call kind:edit → fs/read_text_file + fs/write_text_file
+                         ├── _cursor/update_todos, createPlan, updateTodos → Plan UI
+                         ├── session/set_model → child restart with --model
+                         └── everything else → passthrough
+```
+
+Sessions are persisted at `~/.cursor/cursor-acp/`:
+- `sessions.json` — session index (id, title, cwd, timestamps)
+- `history/<session-id>.jsonl` — full event history per session
 
 ## Development
 
 ```bash
-cargo test                # run unit + integration tests
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
-
-The test suite includes unit tests for CLI parsing/error classification, stream deduplication, diff extraction, and ACP protocol integration tests using an in-process connection harness with fixture scripts.
 
 ## License
 

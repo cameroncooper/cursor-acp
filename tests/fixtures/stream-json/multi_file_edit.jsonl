@@ -1,5 +1,0 @@
-{"type":"assistant","content":[{"type":"text","text":"Applying edits to two files."}]}
-{"type":"tool_call","subtype":"started","call_id":"edit_1","tool_call":{"editToolCall":{"args":{"path":"/tmp/a.txt","old_string":"old a","new_string":"new a"}}}}
-{"type":"tool_call","subtype":"completed","call_id":"edit_1","tool_call":{"editToolCall":{"args":{"path":"/tmp/a.txt","streamContent":"new a"},"result":{"success":{"beforeFullFileContent":"old a","afterFullFileContent":"new a"}}}}}
-{"type":"tool_call","subtype":"completed","call_id":"write_1","tool_call":{"writeToolCall":{"args":{"path":"/tmp/b.txt","content":"content b"},"result":{"success":{"afterFullFileContent":"content b"}}}}}
-{"type":"result","result":"Applied edits to /tmp/a.txt and /tmp/b.txt.","session_id":"cursor-session-edit-1","usage":{"inputTokens":240,"outputTokens":80}}

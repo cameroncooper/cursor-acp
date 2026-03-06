@@ -1,8 +1,8 @@
 {
   "id": "cursor-acp",
-  "name": "Cursor",
-  "version": "0.1.0",
-  "description": "ACP adapter for Cursor headless CLI",
+  "name": "Cursor CLI",
+  "version": "0.2.0",
+  "description": "ACP proxy for Cursor CLI — adds Plan UI from Cursor's todo list",
   "repository": "https://github.com/cameroncooper/cursor-acp",
   "authors": ["Cursor ACP Contributors"],
   "license": "MIT",
