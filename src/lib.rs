@@ -315,8 +315,8 @@ pub async fn run_main() -> Result<()> {
 }
 
 fn resolve_agent_binary() -> String {
-    if let Ok(bin) = std::env::var("CURSOR_AGENT_BIN")
-        .or_else(|_| std::env::var("CURSOR_AGENT_PATH"))
+    if let Ok(bin) =
+        std::env::var("CURSOR_AGENT_BIN").or_else(|_| std::env::var("CURSOR_AGENT_PATH"))
     {
         return bin;
     }
@@ -408,9 +408,15 @@ fn probe_cursor_agent_paths() -> Option<String> {
 
     #[cfg(target_os = "linux")]
     {
-        candidates.push(std::path::PathBuf::from("/usr/share/cursor/resources/app/bin/cursor-agent"));
-        candidates.push(std::path::PathBuf::from("/opt/cursor/resources/app/bin/cursor-agent"));
-        candidates.push(std::path::PathBuf::from("/opt/Cursor/resources/app/bin/cursor-agent"));
+        candidates.push(std::path::PathBuf::from(
+            "/usr/share/cursor/resources/app/bin/cursor-agent",
+        ));
+        candidates.push(std::path::PathBuf::from(
+            "/opt/cursor/resources/app/bin/cursor-agent",
+        ));
+        candidates.push(std::path::PathBuf::from(
+            "/opt/Cursor/resources/app/bin/cursor-agent",
+        ));
         if let Ok(home) = std::env::var("HOME") {
             let base = std::path::PathBuf::from(&home);
             candidates.push(base.join(".local/share/cursor/resources/app/bin/cursor-agent"));
