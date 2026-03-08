@@ -315,13 +315,120 @@ pub async fn run_main() -> Result<()> {
 }
 
 fn resolve_agent_binary() -> String {
-    std::env::var("CURSOR_AGENT_BIN")
+    if let Ok(bin) = std::env::var("CURSOR_AGENT_BIN")
         .or_else(|_| std::env::var("CURSOR_AGENT_PATH"))
-        .unwrap_or_else(|_| "cursor-agent".to_string())
+    {
+        return bin;
+    }
+
+    if which_exists("cursor-agent") {
+        return "cursor-agent".to_string();
+    }
+
+    if let Some(found) = probe_cursor_agent_paths() {
+        tracing::info!(path = %found, "found cursor-agent via known install path");
+        return found;
+    }
+
+    tracing::warn!(
+        "cursor-agent not found on PATH; set CURSOR_AGENT_BIN to the full path of cursor-agent"
+    );
+    "cursor-agent".to_string()
+}
+
+fn which_exists(name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("where")
+            .arg(name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("which")
+            .arg(name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+fn probe_cursor_agent_paths() -> Option<String> {
+    let mut candidates = Vec::new();
+
+    #[cfg(windows)]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            // Shim installed by `cursor --install-agent-cli`
+            candidates.push(
+                std::path::PathBuf::from(&local_app_data)
+                    .join("cursor-agent")
+                    .join("cursor-agent.ps1"),
+            );
+            for dir_name in ["cursor", "Cursor"] {
+                let base = std::path::PathBuf::from(&local_app_data)
+                    .join("Programs")
+                    .join(dir_name);
+                candidates.push(
+                    base.join("resources")
+                        .join("app")
+                        .join("bin")
+                        .join("cursor-agent.exe"),
+                );
+                candidates.push(base.join("cursor-agent.exe"));
+            }
+        }
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            let base = std::path::PathBuf::from(&program_files).join("Cursor");
+            candidates.push(
+                base.join("resources")
+                    .join("app")
+                    .join("bin")
+                    .join("cursor-agent.exe"),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(std::path::PathBuf::from(
+            "/Applications/Cursor.app/Contents/Resources/app/bin/cursor-agent",
+        ));
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(
+                std::path::PathBuf::from(&home)
+                    .join("Applications/Cursor.app/Contents/Resources/app/bin/cursor-agent"),
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        candidates.push(std::path::PathBuf::from("/usr/share/cursor/resources/app/bin/cursor-agent"));
+        candidates.push(std::path::PathBuf::from("/opt/cursor/resources/app/bin/cursor-agent"));
+        candidates.push(std::path::PathBuf::from("/opt/Cursor/resources/app/bin/cursor-agent"));
+        if let Ok(home) = std::env::var("HOME") {
+            let base = std::path::PathBuf::from(&home);
+            candidates.push(base.join(".local/share/cursor/resources/app/bin/cursor-agent"));
+            candidates.push(base.join(".local/bin/cursor-agent"));
+        }
+    }
+
+    for path in &candidates {
+        tracing::debug!(path = %path.display(), "probing for cursor-agent");
+        if path.is_file() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 fn spawn_child(binary: &str, model: Option<&str>) -> Result<Child> {
-    let mut cmd = Command::new(binary);
+    let mut cmd = build_command(binary);
     cmd.arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -337,8 +444,21 @@ fn spawn_child(binary: &str, model: Option<&str>) -> Result<Child> {
     Ok(child)
 }
 
+/// Build a `Command` that handles `.ps1` scripts on Windows by invoking
+/// them through `powershell.exe`, since `.ps1` files are not directly
+/// executable.
+fn build_command(binary: &str) -> Command {
+    #[cfg(windows)]
+    if binary.ends_with(".ps1") {
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", binary]);
+        return cmd;
+    }
+    Command::new(binary)
+}
+
 async fn fetch_models(binary: &str) -> Vec<proxy::ModelInfo> {
-    let output = Command::new(binary)
+    let output = build_command(binary)
         .arg("--list-models")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

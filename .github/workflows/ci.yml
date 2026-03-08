@@ -202,3 +202,28 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check distribution file versions
+        run: |
+          VERSION=$(grep -m1 "^version" Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          ERRORS=0
+
+          EXT_VERSION=$(grep -m1 "^version" distribution/zed-extension/extension.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$EXT_VERSION" != "$VERSION" ]; then
+            echo "::error::extension.toml version ($EXT_VERSION) does not match Cargo.toml ($VERSION)"
+            ERRORS=1
+          fi
+
+          AGENT_VERSION=$(grep -o '"version": "[^"]*"' distribution/acp-registry/cursor-acp/agent.json | head -1 | sed 's/.*"\([^"]*\)"/\1/')
+          if [ "$AGENT_VERSION" != "$VERSION" ]; then
+            echo "::error::agent.json version ($AGENT_VERSION) does not match Cargo.toml ($VERSION)"
+            ERRORS=1
+          fi
+
+          if [ $ERRORS -ne 0 ]; then
+            echo ""
+            echo "Distribution files are out of sync. The release workflow will fix this automatically,"
+            echo "but you can also update them manually or run the release workflow."
+            exit 1
+          fi
+          echo "Distribution file versions match Cargo.toml ($VERSION)"

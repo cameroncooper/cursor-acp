@@ -35,6 +35,37 @@ jobs:
             echo "tag_name=v$VERSION" >> $GITHUB_OUTPUT
           fi
 
+      - name: Update distribution files with release version
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="${{ steps.get_version.outputs.tag_name }}"
+          REPO="https://github.com/${{ github.repository }}"
+
+          # Update extension.toml
+          EXT="distribution/zed-extension/extension.toml"
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" "$EXT"
+          sed -i "s|${REPO}/releases/download/v[^/]*/cursor-acp-[^\"]*|${REPO}/releases/download/${TAG}/cursor-acp-${VERSION}|g" "$EXT"
+
+          # Update agent.json
+          AGENT="distribution/acp-registry/cursor-acp/agent.json"
+          sed -i "s|\"version\": \"[^\"]*\"|\"version\": \"${VERSION}\"|" "$AGENT"
+          sed -i "s|${REPO}/releases/download/v[^/]*/cursor-acp-[^\"]*|${REPO}/releases/download/${TAG}/cursor-acp-${VERSION}|g" "$AGENT"
+
+          echo "Updated distribution files to version ${VERSION} (tag ${TAG})"
+          git diff --stat
+
+      - name: Commit distribution file updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "No changes to commit"
+          else
+            git add distribution/
+            git commit -m "chore: update distribution files for v${{ steps.get_version.outputs.version }}"
+            git push
+          fi
+
   build:
     name: Build - ${{ matrix.os }}
     needs: get-version

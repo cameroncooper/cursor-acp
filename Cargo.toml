@@ -1,6 +1,6 @@
 [package]
 name = "cursor-acp"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["Cursor ACP Contributors"]
 license = "MIT"
