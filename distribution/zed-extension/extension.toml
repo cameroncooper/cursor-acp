@@ -1,6 +1,6 @@
 id = "cursor-acp"
 name = "Cursor ACP"
-version = "1.0.0"
+version = "1.0.1"
 schema_version = 1
 description = "ACP proxy for Cursor CLI — adds session persistence, Plan UI, and edit tracking"
 repository = "https://github.com/cameroncooper/cursor-acp"
