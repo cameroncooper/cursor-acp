@@ -47,6 +47,12 @@ cargo install --git https://github.com/cameroncooper/cursor-acp --locked
 - have `cursor-agent` (or `agent`) on your `PATH`, or
 - set `CURSOR_AGENT_BIN` to the full path.
 
+If you have Cursor installed but not the CLI, you can install it with:
+
+```bash
+cursor --install-agent-cli
+```
+
 ### 2. Add a custom agent in Zed settings
 
 Open Zed settings (`cmd+,` → JSON) and add:
@@ -85,7 +91,7 @@ If `cursor-agent` is not on `PATH`:
 
 1. Open the Agent panel in Zed.
 2. Click **+** and select **Cursor CLI**.
-3. If prompted, authenticate by running `cursor-agent login` (or `agent login`) in your terminal.
+3. If prompted, click **Authenticate** in Zed (it will run `cursor-agent login`), or run `cursor-agent login` (or `agent login`) in your terminal.
 
 ### Debugging
 
@@ -100,6 +106,9 @@ Set `RUST_LOG=debug` in the env config for proxy-level logging.
 | `CURSOR_AGENT_PATH` | Fallback if `CURSOR_AGENT_BIN` is not set |
 | `RUST_LOG` | Tracing level filter (`debug`, `info`, `warn`) |
 | `CURSOR_ACP_SESSIONS_FILE` | Custom path for the session index (default: `~/.cursor/cursor-acp/sessions.json`) |
+| `CURSOR_ACP_WRITE_PLAN_FILE` | Emit plan markdown via `fs/write_text_file` (default: enabled; set `0`/`false` to disable) |
+| `CURSOR_ACP_WRITE_PLAN_FILE_MESSAGE` | Emit a chat message with a `file:///` plan link (default: enabled; set `0`/`false` to disable) |
+| `CURSOR_ACP_LINK_CURSOR_PLAN_FILE` | Prefer linking to existing `.cursor/plans` markdown when available (default: disabled) |
 
 ## Architecture
 

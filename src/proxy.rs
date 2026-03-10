@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
 pub struct ModelInfo {
@@ -12,8 +15,27 @@ pub struct ModelInfo {
 pub struct ProxyState {
     current_session_id: Option<String>,
     todos: Vec<TodoItem>,
+    /// Last `createPlan` markdown per session ID (Zed session ID).
+    plans: HashMap<String, PlanInfo>,
+    /// The absolute cwd for each Zed session ID (best-effort).
+    pub session_cwds: HashMap<String, String>,
+    /// The last plan markdown file path emitted per session.
+    plan_file_paths: HashMap<String, String>,
+    /// Whether to emit plan markdown into a workspace file via `fs/write_text_file`.
+    pub emit_plan_files: bool,
+    /// Whether to also emit a chat message with a `file:///` link.
+    pub emit_plan_file_messages: bool,
+    /// Whether to try to link to Cursor's own plan markdown file (if it already wrote one).
+    pub link_cursor_plan_files: bool,
+    /// Accumulated assistant message text per session for markdown plan detection.
+    plan_detection_buffers: HashMap<String, String>,
+    /// Last derived markdown emitted from assistant-message detection per session.
+    last_detected_plan_markdown: HashMap<String, String>,
     pub models: Vec<ModelInfo>,
     pub selected_model: Option<String>,
+    /// The resolved `cursor-agent` binary path (or name) used to spawn the child.
+    /// Used to provide a reliable login command to Zed via auth method metadata.
+    pub agent_binary: Option<String>,
     pub stored_init_request: Option<String>,
     pub stored_auth_request: Option<String>,
     /// Response IDs to suppress (from replayed init/auth after child restart).
@@ -42,12 +64,25 @@ pub struct ProxyState {
     suppress_zed_response_ids: Vec<Value>,
     /// Counter for generating unique negative IDs for internal proxy requests.
     internal_id_counter: i64,
+    /// One-shot waiters keyed by the JSON-RPC request id string for internal
+    /// `session/new` calls (used during `session/load` to ensure the child
+    /// session exists before Zed starts prompting).
+    pending_session_new_waiters: HashMap<String, oneshot::Sender<String>>,
+    /// Pre-formatted conversation history to inject into the next `session/prompt`
+    /// for a loaded session so the child agent gets context after a restart.
+    pending_history_injection: HashMap<String, String>,
 }
 
 struct TodoItem {
     id: String,
     content: String,
     status: String,
+}
+
+#[derive(Clone, Debug)]
+struct PlanInfo {
+    markdown: String,
+    name: Option<String>,
 }
 
 pub enum AgentAction {
@@ -86,8 +121,20 @@ impl ProxyState {
         Self {
             current_session_id: None,
             todos: Vec::new(),
+            plans: HashMap::new(),
+            session_cwds: HashMap::new(),
+            plan_file_paths: HashMap::new(),
+            emit_plan_files: env_flag_or_default("CURSOR_ACP_WRITE_PLAN_FILE", true),
+            emit_plan_file_messages: env_flag_or_default(
+                "CURSOR_ACP_WRITE_PLAN_FILE_MESSAGE",
+                true,
+            ),
+            link_cursor_plan_files: env_flag_or_default("CURSOR_ACP_LINK_CURSOR_PLAN_FILE", false),
+            plan_detection_buffers: HashMap::new(),
+            last_detected_plan_markdown: HashMap::new(),
             models: Vec::new(),
             selected_model: None,
+            agent_binary: None,
             stored_init_request: None,
             stored_auth_request: None,
             suppress_response_ids: Vec::new(),
@@ -101,6 +148,8 @@ impl ProxyState {
             pending_sessions: HashMap::new(),
             suppress_zed_response_ids: Vec::new(),
             internal_id_counter: -20000,
+            pending_session_new_waiters: HashMap::new(),
+            pending_history_injection: HashMap::new(),
         }
     }
 
@@ -113,6 +162,26 @@ impl ProxyState {
     pub fn next_internal_id(&mut self) -> Value {
         self.internal_id_counter -= 1;
         json!(self.internal_id_counter)
+    }
+
+    /// Register a waiter that will be fulfilled when the child responds to the
+    /// internal `session/new` request with the same id.
+    pub fn register_session_new_waiter(&mut self, id: &Value) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_session_new_waiters.insert(id.to_string(), tx);
+        rx
+    }
+
+    /// Stash a formatted history blob to inject into the next prompt for `session_id`.
+    pub fn set_pending_history_injection(&mut self, session_id: &str, history: String) {
+        if !history.trim().is_empty() {
+            self.pending_history_injection
+                .insert(session_id.to_string(), history);
+        }
+    }
+
+    fn take_pending_history_injection(&mut self, session_id: &str) -> Option<String> {
+        self.pending_history_injection.remove(session_id)
     }
 
     /// Register a Zed response ID to suppress (for our synthesized fs requests).
@@ -138,6 +207,21 @@ impl ProxyState {
         }
 
         messages
+    }
+}
+
+fn env_flag_or_default(key: &str, default: bool) -> bool {
+    parse_env_flag(std::env::var(key).ok().as_deref(), default)
+}
+
+fn parse_env_flag(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        None => default,
     }
 }
 
@@ -182,8 +266,29 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
         Some("session/prompt") => {
             if let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str) {
                 state.zed_session_id = Some(session_id.to_string());
+                state.plan_detection_buffers.remove(session_id);
+                state.last_detected_plan_markdown.remove(session_id);
             }
-            let forwarded = remap_client_session_id(msg, state);
+            let mut patched = msg.clone();
+            if let Some(session_id) = patched.pointer("/params/sessionId").and_then(Value::as_str)
+                && let Some(history) = state.take_pending_history_injection(session_id)
+                && let Some(arr) = patched
+                    .pointer_mut("/params/prompt")
+                    .and_then(Value::as_array_mut)
+            {
+                arr.insert(
+                    0,
+                    json!({
+                        "type": "text",
+                        "text": format!(
+                            "Context from previous conversation (restored by host). Use as background; do not quote verbatim unless asked.\n\n{}",
+                            history
+                        )
+                    }),
+                );
+            }
+
+            let forwarded = remap_client_session_id(&patched, state);
             if let Some(prompt_text) = extract_prompt_text(msg) {
                 ClientAction::ForwardWithPrompt {
                     line: forwarded,
@@ -294,7 +399,7 @@ pub fn process_agent_message(msg: &Value, state: &mut ProxyState) -> AgentAction
         && msg.get("result").is_some()
     {
         state.init_request_id = None;
-        return inject_session_list_capability(msg);
+        return inject_session_list_capability_and_cursor_login_meta(msg, state);
     }
 
     if let Some(session_id) = extract_session_id(msg) {
@@ -330,6 +435,15 @@ pub fn process_agent_message(msg: &Value, state: &mut ProxyState) -> AgentAction
         };
     }
 
+    // Fallback: detect checklist/numbered plans from assistant markdown text
+    // even when no explicit plan tool call was emitted.
+    if let Some(extra) = maybe_extract_plan_from_agent_message(msg, state) {
+        return AgentAction::ForwardWithExtra {
+            line: msg.to_string(),
+            extra_notifications: extra,
+        };
+    }
+
     // Synthesize fs/ requests for edit tool calls so Zed's ActionLog tracks
     // the changed files (enabling the "Edits" panel with accept/reject).
     if let Some(extra) = maybe_synthesize_fs_for_edit(msg, state) {
@@ -356,13 +470,58 @@ pub fn process_agent_message(msg: &Value, state: &mut ProxyState) -> AgentAction
     action
 }
 
-fn inject_session_list_capability(msg: &Value) -> AgentAction {
+fn inject_session_list_capability_and_cursor_login_meta(
+    msg: &Value,
+    state: &ProxyState,
+) -> AgentAction {
     let mut patched = msg.clone();
     if let Some(caps) = patched.pointer_mut("/result/agentCapabilities")
         && let Some(obj) = caps.as_object_mut()
     {
         obj.insert("sessionCapabilities".to_string(), json!({ "list": {} }));
     }
+
+    // Cursor's ACP server advertises an auth method (`cursor_login`) but may still require
+    // the user to run `cursor-agent login` in a terminal. Zed supports an experimental
+    // `terminal-auth` metadata field on auth methods to spawn a login command.
+    if let Some(auth_methods) = patched.pointer_mut("/result/authMethods")
+        && let Some(arr) = auth_methods.as_array_mut()
+    {
+        let command = state
+            .agent_binary
+            .clone()
+            .unwrap_or_else(|| "cursor-agent".to_string());
+
+        for method in arr.iter_mut() {
+            let id = method.get("id").and_then(Value::as_str);
+            let name = method.get("name").and_then(Value::as_str);
+            let is_cursor_login =
+                matches!(id, Some("cursor_login")) || matches!(name, Some("Cursor Login"));
+            if !is_cursor_login {
+                continue;
+            }
+
+            // Ensure `meta.terminal-auth` exists.
+            if method.get("meta").is_none() {
+                method["meta"] = json!({});
+            }
+            if method
+                .pointer("/meta/terminal-auth")
+                .and_then(|v| v.as_object())
+                .is_some()
+            {
+                continue;
+            }
+
+            method["meta"]["terminal-auth"] = json!({
+                "label": "cursor-agent login",
+                "command": command,
+                "args": ["login"],
+                "env": {},
+            });
+        }
+    }
+
     tracing::debug!("injected sessionCapabilities.list into initialize response");
     AgentAction::ForwardPatched(patched.to_string())
 }
@@ -376,12 +535,17 @@ pub fn track_new_session(msg: &Value, state: &mut ProxyState) {
     let session_id = msg.pointer("/result/sessionId").and_then(Value::as_str);
     let request_id = msg.get("id").map(|v| v.to_string());
     if let (Some(sid), Some(rid)) = (session_id, request_id) {
+        if let Some(tx) = state.pending_session_new_waiters.remove(&rid) {
+            drop(tx.send(sid.to_string()));
+        }
+
         // Always track the child's session ID.
         state.child_session_id = Some(sid.to_string());
 
         if let Some(cwd) = state.pending_new_session_cwds.remove(&rid) {
             // Zed-initiated session/new: both IDs match.
             state.zed_session_id = Some(sid.to_string());
+            state.session_cwds.insert(sid.to_string(), cwd.clone());
             state.pending_sessions.insert(sid.to_string(), cwd);
         } else {
             // Load-triggered session/new: child got a new ID but Zed keeps the loaded ID.
@@ -470,7 +634,10 @@ fn remap_session_id(msg: &Value, state: &ProxyState) -> Option<Value> {
 fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<Vec<String>> {
     let update = msg.pointer("/params/update")?;
     let update_type = update.get("sessionUpdate")?.as_str()?;
-    let session_id = state.zed_session_id.clone()?;
+    // Use the sessionId on the message (already remapped to Zed's session id),
+    // instead of state.zed_session_id, so this works during transitions and for
+    // any non-primary sessions (e.g. subagents).
+    let session_id = msg.pointer("/params/sessionId")?.as_str()?.to_string();
 
     match update_type {
         "tool_call" => {
@@ -501,7 +668,22 @@ fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<V
                 paths.push(p.to_string());
             }
 
-            for path in &paths {
+            // Normalize to absolute paths so `fs/read_text_file` targets the correct file.
+            let mut normalized = Vec::new();
+            for p in paths {
+                if let Some(abs) = normalize_path_for_session(&session_id, &p, state) {
+                    if !normalized.contains(&abs) {
+                        normalized.push(abs);
+                    }
+                } else {
+                    tracing::debug!(
+                        path = p.as_str(),
+                        "skipped fs/read_text_file; could not normalize path"
+                    );
+                }
+            }
+
+            for path in &normalized {
                 let id = state.next_internal_id();
                 state.suppress_zed_response(id.clone());
                 let req = json!({
@@ -530,8 +712,18 @@ fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<V
                 if item.get("type").and_then(Value::as_str) != Some("diff") {
                     continue;
                 }
-                let path = item.get("path").and_then(Value::as_str)?;
+                let raw_path = item.get("path").and_then(Value::as_str)?;
                 let new_text = item.get("newText").and_then(Value::as_str)?;
+                let path = match normalize_path_for_session(&session_id, raw_path, state) {
+                    Some(p) => p,
+                    None => {
+                        tracing::debug!(
+                            path = raw_path,
+                            "skipped fs/write_text_file; could not normalize path"
+                        );
+                        continue;
+                    }
+                };
 
                 let id = state.next_internal_id();
                 state.suppress_zed_response(id.clone());
@@ -553,6 +745,24 @@ fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<V
         }
         _ => None,
     }
+}
+
+fn normalize_path_for_session(session_id: &str, path: &str, state: &ProxyState) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Some(path.to_string());
+    }
+    let cwd = state
+        .session_cwds
+        .get(session_id)
+        .or_else(|| state.pending_sessions.get(session_id))?;
+    if !Path::new(cwd).is_absolute() {
+        return None;
+    }
+    Some(PathBuf::from(cwd).join(p).to_string_lossy().into_owned())
 }
 
 /// Extract the user's prompt text from a `session/prompt` request.
@@ -639,10 +849,31 @@ fn maybe_extract_plan_from_tool_call(msg: &Value, state: &mut ProxyState) -> Opt
     }
     let tool_name = update.pointer("/rawInput/_toolName")?.as_str()?;
 
-    let entries = match tool_name {
+    let session_id = state
+        .zed_session_id
+        .as_deref()
+        .or(state.current_session_id.as_deref())?
+        .to_string();
+
+    let entries: Vec<Value> = match tool_name {
         "createPlan" => {
             let plan_text = update.pointer("/rawInput/plan")?.as_str()?;
-            parse_plan_entries(plan_text)
+            let plan_name = update
+                .pointer("/rawInput/name")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+
+            let parsed = parse_plan_entries(plan_text);
+            if !parsed.is_empty() && !plan_text.trim().is_empty() {
+                state.plans.insert(
+                    session_id.clone(),
+                    PlanInfo {
+                        markdown: plan_text.to_string(),
+                        name: plan_name,
+                    },
+                );
+            }
+            parsed
         }
         "updateTodos" => {
             let todos = update.pointer("/rawInput/todos")?.as_array()?;
@@ -704,21 +935,24 @@ fn maybe_extract_plan_from_tool_call(msg: &Value, state: &mut ProxyState) -> Opt
         return None;
     }
 
-    let session_id = state
-        .zed_session_id
-        .as_deref()
-        .or(state.current_session_id.as_deref())?;
+    let mut plan_update = json!({
+        "sessionUpdate": "plan",
+        "entries": entries,
+    });
+
+    attach_plan_markdown_meta(&mut plan_update, &session_id, tool_name, state);
+
+    // `plan_update` is moved into the notification below; keep a copy for
+    // optional synthesized side-effects (e.g. writing plan markdown to a file).
+    let plan_update_for_side_effects = plan_update.clone();
 
     let notification = json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "sessionId": session_id,
-            "update": {
-                "sessionUpdate": "plan",
-                "entries": entries,
-            }
-        }
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": session_id,
+        "update": plan_update,
+      }
     });
 
     tracing::debug!(
@@ -726,7 +960,433 @@ fn maybe_extract_plan_from_tool_call(msg: &Value, state: &mut ProxyState) -> Opt
         tool_name,
         "emitted plan from tool call"
     );
-    Some(vec![notification.to_string()])
+
+    let mut notifications = vec![notification.to_string()];
+
+    if should_emit_plan_file_side_effects(state)
+        && let Some(mut extra) =
+            maybe_emit_plan_markdown_file(&session_id, update, &plan_update_for_side_effects, state)
+    {
+        notifications.append(&mut extra);
+    }
+
+    Some(notifications)
+}
+
+fn maybe_extract_plan_from_agent_message(
+    msg: &Value,
+    state: &mut ProxyState,
+) -> Option<Vec<String>> {
+    if msg.get("method").and_then(Value::as_str) != Some("session/update") {
+        return None;
+    }
+
+    let update = msg.pointer("/params/update")?;
+    if update.get("sessionUpdate")?.as_str()? != "agent_message_chunk" {
+        return None;
+    }
+    if update.pointer("/content/type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    let chunk = update.pointer("/content/text").and_then(Value::as_str)?;
+    if chunk.trim().is_empty() {
+        return None;
+    }
+    let session_id = msg.pointer("/params/sessionId")?.as_str()?.to_string();
+
+    let accumulated = {
+        let buffer = state
+            .plan_detection_buffers
+            .entry(session_id.clone())
+            .or_default();
+        if buffer.len() > 32_768 {
+            // Keep memory bounded while preserving recent context for detection.
+            let split_at = buffer.len().saturating_sub(16_384);
+            buffer.drain(..split_at);
+        }
+        buffer.push_str(chunk);
+        buffer.clone()
+    };
+
+    let entries = parse_plan_entries(&accumulated);
+    if entries.len() < 2 || !looks_like_planning_message(&accumulated, entries.len()) {
+        return None;
+    }
+
+    let derived_markdown = entries_to_markdown(&entries);
+    if derived_markdown.trim().is_empty() {
+        return None;
+    }
+    if state
+        .last_detected_plan_markdown
+        .get(&session_id)
+        .is_some_and(|m| m == &derived_markdown)
+    {
+        return None;
+    }
+    state
+        .last_detected_plan_markdown
+        .insert(session_id.clone(), derived_markdown);
+
+    let mut plan_update = json!({
+        "sessionUpdate": "plan",
+        "entries": entries,
+    });
+    attach_plan_markdown_meta(&mut plan_update, &session_id, "agent_message_chunk", state);
+
+    let plan_update_for_side_effects = plan_update.clone();
+    let notification = json!({
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": session_id,
+        "update": plan_update,
+      }
+    });
+
+    let mut notifications = vec![notification.to_string()];
+    if should_emit_plan_file_side_effects(state)
+        && let Some(mut extra) =
+            maybe_emit_plan_markdown_file(&session_id, update, &plan_update_for_side_effects, state)
+    {
+        notifications.append(&mut extra);
+    }
+    Some(notifications)
+}
+
+fn looks_like_planning_message(text: &str, entry_count: usize) -> bool {
+    if entry_count < 2 {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    let has_checkbox = lower.contains("- [ ]") || lower.contains("- [x]");
+    if has_checkbox {
+        return true;
+    }
+
+    let has_plan_keyword =
+        lower.contains("to-do") || lower.contains("todo") || lower.contains("checklist");
+    if has_plan_keyword {
+        return true;
+    }
+
+    // Numbered 3+ step blocks are often plans even without explicit keywords.
+    let numbered = text
+        .lines()
+        .filter(|line| strip_numbered_prefix(line.trim()).is_some())
+        .count();
+    numbered >= 3
+}
+
+fn should_emit_plan_file_side_effects(state: &ProxyState) -> bool {
+    state.emit_plan_files || state.emit_plan_file_messages
+}
+
+/// Attach additional plan markdown metadata for clients that want richer plan UIs.
+/// Uses ACP's `_meta` extension point so standard clients safely ignore it.
+fn attach_plan_markdown_meta(
+    plan_update: &mut Value,
+    session_id: &str,
+    source_tool: &str,
+    state: &ProxyState,
+) {
+    // Always provide a derived markdown rendering of the current plan entries
+    // (useful even when Cursor didn't provide a createPlan markdown blob).
+    let derived = plan_update
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(|v| entries_to_markdown(v.as_slice()))
+        .unwrap_or_default();
+
+    let mut meta = json!({
+        "cursor-acp": {
+            "sourceTool": source_tool,
+            "derivedTodosMarkdown": derived,
+        }
+    });
+
+    if let Some(plan) = state.plans.get(session_id) {
+        meta["cursor-acp"]["planMarkdown"] = json!(plan.markdown.as_str());
+        if let Some(name) = &plan.name {
+            meta["cursor-acp"]["planName"] = json!(name);
+        }
+    }
+
+    plan_update["_meta"] = meta;
+}
+
+fn entries_to_markdown(entries: &[Value]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        let content = entry
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+
+        let line = match status {
+            "completed" => format!("- [x] {content}\n"),
+            "in_progress" => format!("- [ ] (in progress) {content}\n"),
+            _ => format!("- [ ] {content}\n"),
+        };
+        out.push_str(&line);
+    }
+    out
+}
+
+fn maybe_emit_plan_markdown_file(
+    session_id: &str,
+    tool_call_update: &Value,
+    plan_update: &Value,
+    state: &mut ProxyState,
+) -> Option<Vec<String>> {
+    // Pull markdown from ACP meta we already attached.
+    let cursor_meta = plan_update.pointer("/_meta/cursor-acp")?;
+    let markdown = cursor_meta
+        .get("planMarkdown")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            cursor_meta
+                .get("derivedTodosMarkdown")
+                .and_then(Value::as_str)
+        })?;
+    if markdown.trim().is_empty() {
+        return None;
+    }
+
+    // Prefer an explicit location path if present.
+    let explicit_path = tool_call_update
+        .pointer("/locations/0/path")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    let path = if let Some(ref p) = explicit_path
+        && Path::new(p).is_absolute()
+        && (p.ends_with(".md") || p.ends_with(".mdx") || p.ends_with(".markdown"))
+    {
+        p.clone()
+    } else {
+        let cwd = state
+            .session_cwds
+            .get(session_id)
+            .cloned()
+            .or_else(|| state.pending_sessions.get(session_id).cloned())?;
+        if !Path::new(&cwd).is_absolute() {
+            return None;
+        }
+
+        let plan_name = cursor_meta.get("planName").and_then(Value::as_str);
+        // Try to discover Cursor's own plan file in `.cursor/plans/` first.
+        if state.link_cursor_plan_files {
+            if let Some(found) = discover_cursor_plan_file(&cwd, plan_name, markdown) {
+                found
+            } else {
+                default_plan_file_path(&cwd, plan_name)
+            }
+        } else {
+            default_plan_file_path(&cwd, plan_name)
+        }
+    };
+
+    // If we discovered an existing Cursor plan file and we're only linking, skip writes.
+    let should_write = state.emit_plan_files
+        && !(state.link_cursor_plan_files
+            && explicit_path.is_none()
+            && cursor_plan_dir_path(&path));
+
+    // De-dupe identical writes.
+    if let Some(prev_path) = state.plan_file_paths.get(session_id)
+        && prev_path == &path
+    {
+        // ok
+    } else {
+        state
+            .plan_file_paths
+            .insert(session_id.to_string(), path.clone());
+    }
+
+    let mut notifications = Vec::new();
+
+    // Write file via ACP client fs/write_text_file
+    if should_write {
+        let id = state.next_internal_id();
+        state.suppress_zed_response(id.clone());
+        let write_req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "fs/write_text_file",
+            "params": {
+                "sessionId": session_id,
+                "path": path,
+                "content": markdown,
+            }
+        });
+        notifications.push(write_req.to_string());
+    }
+    if should_write {
+        let id = state.next_internal_id();
+        state.suppress_zed_response(id.clone());
+        let write_req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "fs/write_text_file",
+            "params": {
+                "sessionId": session_id,
+                "path": path,
+                "content": markdown,
+            }
+        });
+        notifications.push(write_req.to_string());
+    }
+
+    if state.emit_plan_file_messages {
+        let abs_path = path.as_str();
+        let file_url = format!(
+            "file:///{}",
+            encode_file_url_path(abs_path.trim_start_matches('/'))
+        );
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": format!("Plan markdown saved to {file_url}") }
+                }
+            }
+        });
+        notifications.push(msg.to_string());
+    }
+
+    Some(notifications)
+}
+
+fn default_plan_file_path(cwd: &str, plan_name: Option<&str>) -> String {
+    let file_name = plan_name
+        .map(sanitize_filename_component)
+        .filter(|s| !s.is_empty())
+        .map(|name| format!(".cursor-acp-plan-{name}.md"))
+        .unwrap_or_else(|| ".cursor-acp-plan.md".to_string());
+    PathBuf::from(cwd)
+        .join(file_name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn cursor_plan_dir_path(abs_path: &str) -> bool {
+    // Heuristic: treat `.cursor/plans/` files as "Cursor-owned".
+    abs_path.contains("/.cursor/plans/") || abs_path.contains("\\.cursor\\plans\\")
+}
+
+fn discover_cursor_plan_file(cwd: &str, plan_name: Option<&str>, markdown: &str) -> Option<String> {
+    let plans_dir = Path::new(cwd).join(".cursor").join("plans");
+    let dir = std::fs::read_dir(&plans_dir).ok()?;
+
+    let needles = plan_needles(plan_name, markdown);
+
+    // Collect candidates with mtime so we can try newest first.
+    let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "md" | "markdown" | "mdx") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((mtime, path));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (_mtime, path) in candidates.into_iter().take(10) {
+        let text = std::fs::read_to_string(&path).ok()?;
+        if looks_like_same_plan(&text, &needles, markdown) {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn plan_needles(plan_name: Option<&str>, markdown: &str) -> Vec<String> {
+    let mut needles = Vec::new();
+    if let Some(name) = plan_name
+        && !name.trim().is_empty()
+    {
+        needles.push(name.trim().to_string());
+    }
+    for line in markdown.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        needles.push(line.to_string());
+        if needles.len() >= 4 {
+            break;
+        }
+    }
+    needles
+}
+
+fn looks_like_same_plan(file_text: &str, needles: &[String], markdown: &str) -> bool {
+    let f = file_text.trim();
+    let m = markdown.trim();
+    if !m.is_empty() && f.contains(m) {
+        return true;
+    }
+    let mut hits = 0usize;
+    for n in needles {
+        if n.len() >= 4 && f.contains(n) {
+            hits += 1;
+        }
+    }
+    hits >= 2
+}
+
+fn sanitize_filename_component(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push('-');
+        } else {
+            out.push('_');
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out.trim_matches(['-', '_', '.']).to_string()
+}
+
+fn encode_file_url_path(path: &str) -> String {
+    // Minimal percent-encoding for `file:///...` links that Zed parses via `url::Url::parse`.
+    // Encode anything outside RFC3986 unreserved + '/'.
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        let c = b as char;
+        let unreserved = c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/');
+        if unreserved {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 /// Parse markdown list items into plan entries.
@@ -828,7 +1488,12 @@ fn handle_update_todos(msg: &Value, state: &mut ProxyState) -> AgentAction {
 
     let mut notifications = Vec::new();
 
-    if let Some(session_id) = &state.current_session_id {
+    if let Some(session_id) = state
+        .zed_session_id
+        .as_deref()
+        .or(state.current_session_id.as_deref())
+    {
+        let session_id = session_id.to_string();
         let entries: Vec<Value> = state
             .todos
             .iter()
@@ -842,18 +1507,32 @@ fn handle_update_todos(msg: &Value, state: &mut ProxyState) -> AgentAction {
             .collect();
 
         if !entries.is_empty() {
+            let mut plan_update = json!({
+                "sessionUpdate": "plan",
+                "entries": entries,
+            });
+            attach_plan_markdown_meta(&mut plan_update, &session_id, "_cursor/update_todos", state);
+            let plan_update_for_side_effects = plan_update.clone();
             let plan_notification = json!({
                 "jsonrpc": "2.0",
                 "method": "session/update",
                 "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "plan",
-                        "entries": entries,
-                    }
+                    "sessionId": &session_id,
+                    "update": plan_update
                 }
             });
             notifications.push(plan_notification.to_string());
+
+            if should_emit_plan_file_side_effects(state)
+                && let Some(mut extra) = maybe_emit_plan_markdown_file(
+                    &session_id,
+                    params,
+                    &plan_update_for_side_effects,
+                    state,
+                )
+            {
+                notifications.append(&mut extra);
+            }
         }
     }
 
@@ -1296,6 +1975,23 @@ Tip: use --model <id> to switch.
     }
 
     #[test]
+    fn parse_env_flag_defaults_and_overrides() {
+        assert!(parse_env_flag(None, true));
+        assert!(!parse_env_flag(None, false));
+
+        assert!(!parse_env_flag(Some("0"), true));
+        assert!(!parse_env_flag(Some("false"), true));
+        assert!(!parse_env_flag(Some("off"), true));
+
+        assert!(parse_env_flag(Some("1"), false));
+        assert!(parse_env_flag(Some("true"), false));
+        assert!(parse_env_flag(Some("on"), false));
+
+        assert!(parse_env_flag(Some("unexpected"), true));
+        assert!(!parse_env_flag(Some("unexpected"), false));
+    }
+
+    #[test]
     fn cancelled_and_empty_todos_filtered_from_plan() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("s1".to_string());
@@ -1481,6 +2177,196 @@ Tip: use --model <id> to switch.
     }
 
     #[test]
+    fn detect_plan_from_agent_message_checklist() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "## To-Do Plan\n\n- [ ] Create `joke.txt`\n- [ ] Add joke\n- [ ] Delete `joke.txt`"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 1);
+                let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                let entries = notif["params"]["update"]["entries"].as_array().unwrap();
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0]["content"], "Create `joke.txt`");
+                assert_eq!(entries[1]["content"], "Add joke");
+                assert_eq!(entries[2]["content"], "Delete `joke.txt`");
+                let meta = &notif["params"]["update"]["_meta"]["cursor-acp"];
+                assert_eq!(meta["sourceTool"], "agent_message_chunk");
+            }
+            _ => panic!("expected ForwardWithExtra"),
+        }
+    }
+
+    #[test]
+    fn detect_plan_from_agent_message_can_emit_plan_file_message() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), "/tmp".to_string());
+        state.emit_plan_files = false;
+        state.emit_plan_file_messages = true;
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "## To-Do Plan\n\n- [ ] Create `joke.txt`\n- [ ] Add joke\n- [ ] Delete `joke.txt`"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 2);
+
+                let has_write = extra_notifications.iter().any(|s| {
+                    serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
+                        v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
+                    })
+                });
+                assert!(!has_write, "message-only mode should not write file");
+
+                let msg_ix = extra_notifications
+                    .iter()
+                    .position(|s| {
+                        serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
+                            v.pointer("/params/update/sessionUpdate")
+                                .and_then(Value::as_str)
+                                == Some("agent_message_chunk")
+                        })
+                    })
+                    .expect("missing plan file message notification");
+                let msg_notif: Value = serde_json::from_str(&extra_notifications[msg_ix]).unwrap();
+                let text = msg_notif
+                    .pointer("/params/update/content/text")
+                    .and_then(Value::as_str)
+                    .unwrap();
+                assert!(text.contains("Plan markdown saved to file:///"));
+            }
+            _ => panic!("expected ForwardWithExtra"),
+        }
+    }
+
+    #[test]
+    fn ignore_non_plan_bullet_lists_in_agent_message() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "Key points:\n- Keep output concise\n- Prefer deterministic tests"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::Forward => {}
+            _ => panic!("expected Forward for non-plan bullets"),
+        }
+    }
+
+    #[test]
+    fn detect_streamed_agent_message_plan_once() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+
+        let msg1 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "## To-Do Plan\n\n- [ ] Create file\n" }
+                }
+            }
+        });
+        let msg2 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "- [ ] Add joke\n- [ ] Delete file\n" }
+                }
+            }
+        });
+        let msg3 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Done when all checks pass." }
+                }
+            }
+        });
+
+        match process_agent_message(&msg1, &mut state) {
+            AgentAction::Forward => {}
+            _ => panic!("expected initial chunk to forward"),
+        }
+        match process_agent_message(&msg2, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 1);
+                let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                let entries = notif["params"]["update"]["entries"].as_array().unwrap();
+                assert_eq!(entries.len(), 3);
+            }
+            _ => panic!("expected plan emission once enough chunks arrive"),
+        }
+        match process_agent_message(&msg3, &mut state) {
+            AgentAction::Forward => {}
+            _ => panic!("expected deduped follow-up chunk to forward"),
+        }
+    }
+
+    #[test]
     fn create_plan_tool_call_emits_plan() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
@@ -1515,6 +2401,153 @@ Tip: use --model <id> to switch.
                 let entries = notif["params"]["update"]["entries"].as_array().unwrap();
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0]["content"], "Create file");
+
+                let meta = &notif["params"]["update"]["_meta"]["cursor-acp"];
+                assert_eq!(meta["sourceTool"], "createPlan");
+                assert_eq!(meta["planMarkdown"], "# Jokes\n\n- Create file\n- Add joke");
+                assert_eq!(meta["planName"], "jokes");
+                assert_eq!(
+                    meta["derivedTodosMarkdown"],
+                    "- [ ] Create file\n- [ ] Add joke\n"
+                );
+            }
+            _ => panic!("expected ForwardWithExtra"),
+        }
+    }
+
+    #[test]
+    fn create_plan_can_emit_plan_file_write_request() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), "/tmp".to_string());
+        state.emit_plan_files = true;
+        state.emit_plan_file_messages = true;
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1",
+                    "title": "Create Plan: jokes",
+                    "rawInput": {
+                        "_toolName": "createPlan",
+                        "name": "jokes",
+                        "plan": "# Jokes\n\n- Create file\n- Add joke"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                // We expect the synthesized plan update, a synthesized fs write request,
+                // and a synthesized message with a file link. Some configurations may
+                // emit an additional fs/read_text_file or similar internal request, so
+                // assert a minimum and then locate the ones we care about.
+                assert!(
+                    extra_notifications.len() >= 3,
+                    "expected at least plan + fs write + msg"
+                );
+
+                let plan_notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                assert_eq!(
+                    plan_notif.pointer("/params/update/sessionUpdate").unwrap(),
+                    "plan"
+                );
+
+                let write_ix = extra_notifications
+                    .iter()
+                    .position(|s| {
+                        serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
+                            v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
+                        })
+                    })
+                    .expect("missing fs/write_text_file request");
+                let write_req: Value =
+                    serde_json::from_str(&extra_notifications[write_ix]).unwrap();
+                assert_eq!(write_req["method"], "fs/write_text_file");
+                assert_eq!(write_req["params"]["sessionId"], "zed-sess");
+                assert!(
+                    write_req["params"]["path"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with(".md")
+                );
+                assert_eq!(
+                    write_req["params"]["content"],
+                    "# Jokes\n\n- Create file\n- Add joke"
+                );
+
+                let msg_ix = extra_notifications
+                    .iter()
+                    .position(|s| {
+                        serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
+                            v.pointer("/params/update/sessionUpdate")
+                                .and_then(Value::as_str)
+                                == Some("agent_message_chunk")
+                        })
+                    })
+                    .expect("missing agent_message_chunk notification");
+                let msg_notif: Value = serde_json::from_str(&extra_notifications[msg_ix]).unwrap();
+                assert_eq!(
+                    msg_notif.pointer("/params/update/sessionUpdate").unwrap(),
+                    "agent_message_chunk"
+                );
+            }
+            _ => panic!("expected ForwardWithExtra"),
+        }
+    }
+
+    #[test]
+    fn create_plan_can_emit_plan_file_message_without_write() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), "/tmp".to_string());
+        state.emit_plan_files = false;
+        state.emit_plan_file_messages = true;
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1",
+                    "title": "Create Plan: jokes",
+                    "rawInput": {
+                        "_toolName": "createPlan",
+                        "name": "jokes",
+                        "plan": "# Jokes\n\n- Create file\n- Add joke"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 2);
+                let has_write = extra_notifications.iter().any(|s| {
+                    serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
+                        v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
+                    })
+                });
+                assert!(!has_write, "message-only mode should not write file");
             }
             _ => panic!("expected ForwardWithExtra"),
         }
@@ -1653,6 +2686,44 @@ Tip: use --model <id> to switch.
     }
 
     #[test]
+    fn update_todos_request_can_emit_plan_file_message_without_write() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-id".to_string());
+        state.current_session_id = Some("zed-id".to_string());
+        state
+            .session_cwds
+            .insert("zed-id".to_string(), "/tmp".to_string());
+        state.emit_plan_files = false;
+        state.emit_plan_file_messages = true;
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "_cursor/update_todos",
+            "params": {
+                "todos": [{ "id": "1", "content": "Task A", "status": "pending" }],
+                "merge": false
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::Intercept {
+                notifications_to_zed,
+                ..
+            } => {
+                assert_eq!(notifications_to_zed.len(), 2);
+                let has_write = notifications_to_zed.iter().any(|s| {
+                    serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
+                        v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
+                    })
+                });
+                assert!(!has_write, "message-only mode should not write file");
+            }
+            _ => panic!("expected Intercept"),
+        }
+    }
+
+    #[test]
     fn synthesize_read_for_edit_tool_call() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
@@ -1689,6 +2760,45 @@ Tip: use --model <id> to switch.
             _ => panic!("expected ForwardWithExtra with read request"),
         }
         assert_eq!(state.suppress_zed_response_ids.len(), 1);
+    }
+
+    #[test]
+    fn synthesize_read_normalizes_relative_paths_using_session_cwd() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), "/work".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-1",
+                    "title": "Edit file",
+                    "kind": "edit",
+                    "status": "pending",
+                    "rawInput": { "path": "src/foo.md" },
+                    "locations": [{ "path": "src/foo.md" }]
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 1);
+                let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                assert_eq!(req["method"], "fs/read_text_file");
+                assert_eq!(req["params"]["path"], "/work/src/foo.md");
+            }
+            _ => panic!("expected ForwardWithExtra"),
+        }
     }
 
     #[test]
@@ -1730,6 +2840,48 @@ Tip: use --model <id> to switch.
             _ => panic!("expected ForwardWithExtra with write request"),
         }
         assert_eq!(state.suppress_zed_response_ids.len(), 1);
+    }
+
+    #[test]
+    fn synthesize_write_normalizes_relative_paths_using_session_cwd() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), "/work".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-1",
+                    "status": "completed",
+                    "content": [{
+                        "type": "diff",
+                        "path": "src/foo.md",
+                        "oldText": "old",
+                        "newText": "new"
+                    }]
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 1);
+                let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                assert_eq!(req["method"], "fs/write_text_file");
+                assert_eq!(req["params"]["path"], "/work/src/foo.md");
+                assert_eq!(req["params"]["content"], "new");
+            }
+            _ => panic!("expected ForwardWithExtra with write request"),
+        }
     }
 
     #[test]
