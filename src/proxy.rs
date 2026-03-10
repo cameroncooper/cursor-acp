@@ -71,6 +71,10 @@ pub struct ProxyState {
     /// Pre-formatted conversation history to inject into the next `session/prompt`
     /// for a loaded session so the child agent gets context after a restart.
     pending_history_injection: HashMap<String, String>,
+    /// The workspace cwd for this proxy instance, learned from the first
+    /// `session/new` request. Used to scope `session/list` to this workspace
+    /// when the client doesn't provide a `cwd` filter.
+    pub workspace_cwd: Option<String>,
 }
 
 struct TodoItem {
@@ -150,6 +154,7 @@ impl ProxyState {
             internal_id_counter: -20000,
             pending_session_new_waiters: HashMap::new(),
             pending_history_injection: HashMap::new(),
+            workspace_cwd: None,
         }
     }
 
@@ -260,6 +265,9 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
                 msg.pointer("/params/cwd").and_then(Value::as_str),
             ) {
                 state.pending_new_session_cwds.insert(id, cwd.to_string());
+                if state.workspace_cwd.is_none() {
+                    state.workspace_cwd = Some(cwd.to_string());
+                }
             }
             ClientAction::Forward
         }
@@ -535,6 +543,15 @@ pub fn track_new_session(msg: &Value, state: &mut ProxyState) {
     let session_id = msg.pointer("/result/sessionId").and_then(Value::as_str);
     let request_id = msg.get("id").map(|v| v.to_string());
     if let (Some(sid), Some(rid)) = (session_id, request_id) {
+        // Cache modes/models from session/new responses even when the response
+        // will later be suppressed (e.g. internal session/new during session/load).
+        if let Some(modes) = msg.pointer("/result/modes") {
+            state.last_session_modes = Some(modes.clone());
+        }
+        if let Some(models) = msg.pointer("/result/models") {
+            state.last_session_models = Some(models.clone());
+        }
+
         if let Some(tx) = state.pending_session_new_waiters.remove(&rid) {
             drop(tx.send(sid.to_string()));
         }
@@ -1230,21 +1247,6 @@ fn maybe_emit_plan_markdown_file(
         });
         notifications.push(write_req.to_string());
     }
-    if should_write {
-        let id = state.next_internal_id();
-        state.suppress_zed_response(id.clone());
-        let write_req = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "fs/write_text_file",
-            "params": {
-                "sessionId": session_id,
-                "path": path,
-                "content": markdown,
-            }
-        });
-        notifications.push(write_req.to_string());
-    }
 
     if state.emit_plan_file_messages {
         let abs_path = path.as_str();
@@ -1259,7 +1261,7 @@ fn maybe_emit_plan_markdown_file(
                 "sessionId": session_id,
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": format!("Plan markdown saved to {file_url}") }
+                    "content": { "type": "text", "text": format!("Plan markdown saved to {file_url}\n") }
                 }
             }
         });

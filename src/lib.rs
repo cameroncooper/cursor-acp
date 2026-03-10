@@ -109,9 +109,19 @@ pub async fn run_main() -> Result<()> {
             if let Some(ref msg) = msg
                 && msg.get("method").and_then(Value::as_str) == Some("session/list")
             {
-                let cwd = msg.pointer("/params/cwd").and_then(Value::as_str);
+                let explicit_cwd = msg
+                    .pointer("/params/cwd")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let cwd = match explicit_cwd {
+                    Some(c) => Some(c),
+                    None => {
+                        let st = stdin_state.lock().await;
+                        st.workspace_cwd.clone()
+                    }
+                };
                 let request_id = msg.get("id").cloned().unwrap_or(Value::Null);
-                let entries = stdin_store.list_sessions(cwd).await;
+                let entries = stdin_store.list_sessions(cwd.as_deref()).await;
                 tracing::info!(count = entries.len(), ?cwd, "listed sessions");
                 let response = sessions::build_list_response(&request_id, &entries);
                 drop(stdin_to_zed.send(response));
@@ -187,11 +197,8 @@ pub async fn run_main() -> Result<()> {
                 // Wait briefly for the child session to be created so that Zed's
                 // immediate follow-up prompts are reliably remapped.
                 drop(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        child_session_ready_rx,
-                    )
-                    .await,
+                    tokio::time::timeout(std::time::Duration::from_secs(2), child_session_ready_rx)
+                        .await,
                 );
 
                 // Respond to session/load *after* history replay, per ACP expectations.
