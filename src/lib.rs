@@ -1,5 +1,6 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -22,20 +23,57 @@ pub async fn run_main() -> Result<()> {
     let binary = resolve_agent_binary();
     tracing::info!(binary = %binary, "starting cursor-acp proxy");
 
-    let models = fetch_models(&binary).await;
-    tracing::info!(count = models.len(), "loaded models");
+    let binary_available = binary_available(&binary);
+    if !binary_available {
+        tracing::warn!(
+            binary = %binary,
+            "cursor-agent not available; will expose install prompt to client"
+        );
+    }
+
+    let models = if binary_available {
+        let models = fetch_models(&binary).await;
+        tracing::info!(count = models.len(), "loaded models");
+        models
+    } else {
+        Vec::new()
+    };
 
     let state = Arc::new(Mutex::new(proxy::ProxyState::new()));
-    state.lock().await.models = models;
+    {
+        let mut st = state.lock().await;
+        st.models = models;
+        st.agent_binary = Some(binary.clone());
+    }
 
     let store = Arc::new(sessions::SessionStore::new().await);
 
+    // Periodic flush task: persist session index every 30s if dirty.
+    let flush_store = Arc::clone(&store);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            flush_store.flush_if_dirty().await;
+        }
+    });
+
     let (to_zed_tx, to_zed_rx) = mpsc::unbounded_channel::<String>();
 
-    // Spawn initial child.
-    let child_handle = Arc::new(Mutex::new(
-        spawn_child(&binary, None).context("failed to spawn initial agent acp")?,
-    ));
+    // Spawn initial child if possible. If not, we still start and let Zed prompt
+    // the user to install Cursor CLI.
+    let initial_child = if binary_available {
+        match spawn_child(&binary, None) {
+            Ok(child) => Some(child),
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to spawn initial agent; will run without child");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(initial_child));
 
     let (to_child_tx, to_child_rx) = mpsc::unbounded_channel::<String>();
     let to_child_for_intercept = to_child_tx.clone();
@@ -55,13 +93,45 @@ pub async fn run_main() -> Result<()> {
         while let Ok(Some(line)) = lines.next_line().await {
             let msg: Option<Value> = serde_json::from_str(&line).ok();
 
+            // If we don't have a child process, we can still answer initialize so Zed
+            // can show an "Install Cursor CLI" action.
+            if let Some(ref msg) = msg
+                && msg.get("method").and_then(Value::as_str) == Some("initialize")
+            {
+                let child_missing = stdin_child_handle.lock().await.is_none();
+                if child_missing {
+                    // Still store the init request for potential future use.
+                    {
+                        let mut st = stdin_state.lock().await;
+                        drop(proxy::process_client_message(msg, &mut st));
+                    }
+
+                    let request_id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    let (install_cmd, install_args) = resolve_cursor_install_command();
+                    let response =
+                        bootstrap_initialize_response(&request_id, &install_cmd, &install_args);
+                    drop(stdin_to_zed.send(response));
+                    continue;
+                }
+            }
+
             // Handle session/list directly (not forwarded to child).
             if let Some(ref msg) = msg
                 && msg.get("method").and_then(Value::as_str) == Some("session/list")
             {
-                let cwd = msg.pointer("/params/cwd").and_then(Value::as_str);
+                let explicit_cwd = msg
+                    .pointer("/params/cwd")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let cwd = match explicit_cwd {
+                    Some(c) => Some(c),
+                    None => {
+                        let st = stdin_state.lock().await;
+                        st.workspace_cwd.clone()
+                    }
+                };
                 let request_id = msg.get("id").cloned().unwrap_or(Value::Null);
-                let entries = stdin_store.list_sessions(cwd).await;
+                let entries = stdin_store.list_sessions(cwd.as_deref()).await;
                 tracing::info!(count = entries.len(), ?cwd, "listed sessions");
                 let response = sessions::build_list_response(&request_id, &entries);
                 drop(stdin_to_zed.send(response));
@@ -78,6 +148,70 @@ pub async fn run_main() -> Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or("");
 
+                // Replay stored history as session/update notifications.
+                let history = stdin_store.load_history(session_id).await;
+                tracing::info!(
+                    count = history.len(),
+                    session_id,
+                    "replaying session history"
+                );
+                for update in &history {
+                    let notification = sessions::build_history_notification(session_id, update);
+                    drop(stdin_to_zed.send(notification));
+                }
+
+                // Set the Zed session ID and create a fresh session in the child
+                // so subsequent prompts have a valid context.
+                let cwd = msg
+                    .pointer("/params/cwd")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let stored_cwd = if cwd.is_none() {
+                    stdin_store
+                        .list_sessions(None)
+                        .await
+                        .iter()
+                        .find(|s| s.id == session_id)
+                        .map(|s| s.cwd.clone())
+                } else {
+                    None
+                };
+                let cwd = cwd.or(stored_cwd).unwrap_or_else(|| ".".to_string());
+
+                // Also stash a condensed history blob so the next `session/prompt`
+                // includes context for the child agent after a restart.
+                let history_for_child = format_history_for_child(&history);
+
+                let (load_req_id, child_session_ready_rx) = {
+                    let mut st = stdin_state.lock().await;
+                    st.zed_session_id = Some(session_id.to_string());
+                    st.session_cwds.insert(session_id.to_string(), cwd.clone());
+                    st.set_pending_history_injection(session_id, history_for_child);
+                    let req_id = st.next_internal_id();
+                    st.suppress_response(req_id.clone());
+                    let rx = st.register_session_new_waiter(&req_id);
+                    (req_id, rx)
+                };
+                let child_new_request = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": load_req_id,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": cwd,
+                        "mcpServers": []
+                    }
+                });
+                tracing::debug!(session_id, %cwd, "sending session/new to child for loaded session");
+                drop(current_to_child.send(child_new_request.to_string()));
+
+                // Wait briefly for the child session to be created so that Zed's
+                // immediate follow-up prompts are reliably remapped.
+                drop(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), child_session_ready_rx)
+                        .await,
+                );
+
+                // Respond to session/load *after* history replay, per ACP expectations.
                 let (modes, models) = {
                     let st = stdin_state.lock().await;
                     let modes = st.last_session_modes.clone().unwrap_or_else(|| {
@@ -112,55 +246,29 @@ pub async fn run_main() -> Result<()> {
                 let response =
                     sessions::build_load_response(&request_id, Some(&modes), Some(&models));
                 drop(stdin_to_zed.send(response));
+                continue;
+            }
 
-                // Replay stored history as session/update notifications.
-                let history = stdin_store.load_history(session_id).await;
-                tracing::info!(
-                    count = history.len(),
-                    session_id,
-                    "replaying session history"
-                );
-                for update in &history {
-                    let notification = sessions::build_history_notification(session_id, update);
-                    drop(stdin_to_zed.send(notification));
+            // If we still don't have a child, refuse requests with a helpful message.
+            let child_missing = stdin_child_handle.lock().await.is_none();
+            if child_missing {
+                if let Some(ref msg) = msg
+                    && msg.get("id").is_some()
+                    && msg.get("method").is_some()
+                {
+                    let request_id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    let method = msg
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let response = bootstrap_error_response(
+                        &request_id,
+                        &format!(
+                            "Cursor CLI is not installed (missing `cursor-agent`). Install it via the agent's Authenticate button (Install Cursor CLI), then restart the thread. (request: {method})"
+                        ),
+                    );
+                    drop(stdin_to_zed.send(response));
                 }
-
-                // Set the Zed session ID and create a fresh session in the child
-                // so subsequent prompts have a valid context.
-                let cwd = msg
-                    .pointer("/params/cwd")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                let stored_cwd = if cwd.is_none() {
-                    stdin_store
-                        .list_sessions(None)
-                        .await
-                        .iter()
-                        .find(|s| s.id == session_id)
-                        .map(|s| s.cwd.clone())
-                } else {
-                    None
-                };
-                let cwd = cwd.or(stored_cwd).unwrap_or_else(|| ".".to_string());
-
-                let load_req_id = {
-                    let mut st = stdin_state.lock().await;
-                    st.zed_session_id = Some(session_id.to_string());
-                    let req_id = serde_json::json!(-9999);
-                    st.suppress_response(req_id.clone());
-                    req_id
-                };
-                let child_new_request = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": load_req_id,
-                    "method": "session/new",
-                    "params": {
-                        "cwd": cwd,
-                        "mcpServers": []
-                    }
-                });
-                tracing::debug!(session_id, %cwd, "sending session/new to child for loaded session");
-                drop(current_to_child.send(child_new_request.to_string()));
                 continue;
             }
 
@@ -221,27 +329,37 @@ pub async fn run_main() -> Result<()> {
                         // Kill old child.
                         {
                             let mut handle = stdin_child_handle.lock().await;
-                            drop(handle.stdin.take());
-                            handle.kill().await.ok();
+                            if let Some(child) = handle.as_mut() {
+                                drop(child.stdin.take());
+                                child.kill().await.ok();
+                            }
                         }
 
                         // Spawn new child.
                         match spawn_child(&binary_for_restart, Some(&model)) {
                             Ok(new_child) => {
-                                *stdin_child_handle.lock().await = new_child;
+                                *stdin_child_handle.lock().await = Some(new_child);
 
                                 // New channels for the new child's stdin.
                                 let (new_tx, new_rx) = mpsc::unbounded_channel::<String>();
                                 current_to_child = new_tx.clone();
 
                                 // Spawn new child writer.
-                                let new_stdin =
-                                    stdin_child_handle.lock().await.stdin.take().unwrap();
+                                let new_stdin = stdin_child_handle
+                                    .lock()
+                                    .await
+                                    .as_mut()
+                                    .and_then(|c| c.stdin.take())
+                                    .unwrap();
                                 tokio::spawn(write_to_sink(new_stdin, new_rx));
 
                                 // Spawn new child reader.
-                                let new_stdout =
-                                    stdin_child_handle.lock().await.stdout.take().unwrap();
+                                let new_stdout = stdin_child_handle
+                                    .lock()
+                                    .await
+                                    .as_mut()
+                                    .and_then(|c| c.stdout.take())
+                                    .unwrap();
                                 let reader_to_zed = stdin_to_zed.clone();
                                 let reader_to_child = new_tx;
                                 let reader_state = Arc::clone(&stdin_state);
@@ -322,11 +440,10 @@ pub async fn run_main() -> Result<()> {
         tracing::debug!("stdin EOF");
     });
 
-    // Take child's stdin/stdout for the initial child.
-    {
-        let mut handle = child_handle.lock().await;
-        let child_stdin = handle.stdin.take().context("child stdin")?;
-        let child_stdout = handle.stdout.take().context("child stdout")?;
+    // Take child's stdin/stdout for the initial child (if available).
+    if let Some(child) = child_handle.lock().await.as_mut() {
+        let child_stdin = child.stdin.take().context("child stdin")?;
+        let child_stdout = child.stdout.take().context("child stdout")?;
 
         // Task: write to initial child's stdin.
         tokio::spawn(write_to_sink(child_stdin, to_child_rx));
@@ -339,6 +456,9 @@ pub async fn run_main() -> Result<()> {
             Arc::clone(&state),
             Arc::clone(&store),
         ));
+    } else {
+        // Drop receiver so any sends fail fast (we guard on child existence anyway).
+        drop(to_child_rx);
     }
 
     // Task: write to Zed's stdout. Finishes when all to_zed_tx senders are dropped.
@@ -347,6 +467,9 @@ pub async fn run_main() -> Result<()> {
     // Wait for stdin to close (Zed disconnected).
     drop(stdin_task.await);
     tracing::debug!("stdin task finished, draining child output");
+
+    // Flush session index on shutdown.
+    store.flush_if_dirty().await;
 
     // Give the child time to finish processing and produce output,
     // then wait for stdout to drain. If the child exits on its own
@@ -357,7 +480,9 @@ pub async fn run_main() -> Result<()> {
     }
 
     let mut handle = child_handle.lock().await;
-    handle.kill().await.ok();
+    if let Some(child) = handle.as_mut() {
+        child.kill().await.ok();
+    }
 
     Ok(())
 }
@@ -382,6 +507,90 @@ fn resolve_agent_binary() -> String {
         "cursor-agent not found on PATH; set CURSOR_AGENT_BIN to the full path of cursor-agent"
     );
     "cursor-agent".to_string()
+}
+
+fn binary_available(binary: &str) -> bool {
+    let p = Path::new(binary);
+    if p.components().count() > 1 {
+        return p.is_file();
+    }
+    which_exists(binary)
+}
+
+fn resolve_cursor_install_command() -> (String, Vec<String>) {
+    // Prefer `cursor --install-agent-cli` when available.
+    if which_exists("cursor") {
+        return (
+            "cursor".to_string(),
+            vec!["--install-agent-cli".to_string()],
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = ["/Applications/Cursor.app/Contents/Resources/app/bin/cursor"];
+        for c in candidates {
+            if Path::new(c).is_file() {
+                return (c.to_string(), vec!["--install-agent-cli".to_string()]);
+            }
+        }
+    }
+
+    // Fallback: open the docs/download page.
+    #[cfg(target_os = "macos")]
+    return (
+        "open".to_string(),
+        vec!["https://cursor.com/docs/cli".to_string()],
+    );
+
+    #[cfg(not(target_os = "macos"))]
+    (
+        "cursor".to_string(),
+        vec!["--install-agent-cli".to_string()],
+    )
+}
+
+fn bootstrap_initialize_response(request_id: &Value, command: &str, args: &[String]) -> String {
+    let description = "Cursor CLI is not installed (missing `cursor-agent`). Click Authenticate to install it, then restart the thread.";
+    let resp = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+                "mcpCapabilities": { "http": true, "sse": true },
+                "promptCapabilities": { "audio": false, "embeddedContext": false, "image": true },
+                "sessionCapabilities": { "list": {} }
+            },
+            "authMethods": [{
+                "id": "install_cursor_cli",
+                "name": "Install Cursor CLI",
+                "description": description,
+                "meta": {
+                    "terminal-auth": {
+                        "label": "Install Cursor CLI",
+                        "command": command,
+                        "args": args,
+                        "env": {}
+                    }
+                }
+            }]
+        }
+    });
+    resp.to_string()
+}
+
+fn bootstrap_error_response(request_id: &Value, message: &str) -> String {
+    let resp = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32001,
+            "message": message
+        }
+    });
+    resp.to_string()
 }
 
 fn which_exists(name: &str) -> bool {
@@ -650,4 +859,43 @@ async fn write_stdout(mut rx: mpsc::UnboundedReceiver<String>) {
         }
     }
     tracing::debug!("stdout writer done");
+}
+
+fn format_history_for_child(history: &[Value]) -> String {
+    let mut out = String::new();
+    for update in history {
+        let kind = update.get("sessionUpdate").and_then(Value::as_str);
+        match kind {
+            Some("user_message_chunk") => {
+                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
+                    out.push_str("User: ");
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
+            Some("agent_message_chunk") | Some("assistant_message_chunk") => {
+                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
+                    out.push_str("Assistant: ");
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Keep the injected context bounded to avoid excessive prompt growth.
+    const MAX_CHARS: usize = 12_000;
+    if out.len() <= MAX_CHARS {
+        return out.trim().to_string();
+    }
+    out.chars()
+        .rev()
+        .take(MAX_CHARS)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .trim()
+        .to_string()
 }

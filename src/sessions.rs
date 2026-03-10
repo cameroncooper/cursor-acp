@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
@@ -22,6 +23,7 @@ struct SessionIndex {
 pub struct SessionStore {
     base_dir: PathBuf,
     index: Mutex<SessionIndex>,
+    dirty: AtomicBool,
 }
 
 impl SessionStore {
@@ -32,6 +34,7 @@ impl SessionStore {
         Self {
             base_dir,
             index: Mutex::new(index),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -41,6 +44,7 @@ impl SessionStore {
         Self {
             base_dir,
             index: Mutex::new(index),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -91,12 +95,11 @@ impl SessionStore {
     }
 
     pub async fn append_history(&self, session_id: &str, update: &Value) {
-        // Update the in-memory timestamp (no flush — index is flushed on
-        // create/title changes which is sufficient for persistence).
         {
             let mut index = self.index.lock().await;
             if let Some(entry) = index.sessions.iter_mut().find(|s| s.id == session_id) {
                 entry.updated_at = current_time_ms();
+                self.dirty.store(true, Ordering::Relaxed);
             }
         }
 
@@ -116,6 +119,9 @@ impl SessionStore {
             Ok(mut f) => {
                 if let Err(e) = f.write_all(line.as_bytes()).await {
                     tracing::warn!(err = %e, "failed to append history");
+                }
+                if let Err(e) = f.sync_all().await {
+                    tracing::warn!(err = %e, "failed to sync history file");
                 }
             }
             Err(e) => tracing::warn!(err = %e, "failed to open history file"),
@@ -160,6 +166,7 @@ impl SessionStore {
     }
 
     async fn flush_index(&self) {
+        self.dirty.store(false, Ordering::Relaxed);
         if let Err(e) = tokio::fs::create_dir_all(&self.base_dir).await {
             tracing::warn!(err = %e, "failed to create session store directory");
             return;
@@ -172,6 +179,12 @@ impl SessionStore {
                 }
             }
             Err(e) => tracing::warn!(err = %e, "failed to serialize session index"),
+        }
+    }
+
+    pub async fn flush_if_dirty(&self) {
+        if self.dirty.load(Ordering::Relaxed) {
+            self.flush_index().await;
         }
     }
 }
