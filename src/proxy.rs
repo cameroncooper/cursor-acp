@@ -1268,9 +1268,7 @@ fn maybe_emit_plan_markdown_file(
         notifications.push(write_req.to_string());
     }
 
-    if state.emit_plan_file_messages
-        && !state.plan_file_message_emitted.contains(session_id)
-    {
+    if state.emit_plan_file_messages && !state.plan_file_message_emitted.contains(session_id) {
         state
             .plan_file_message_emitted
             .insert(session_id.to_string());
@@ -1442,7 +1440,9 @@ fn parse_todos_from_code_block(plan_text: &str) -> Option<Vec<Value>> {
         .filter_map(|item| {
             let content = item.get("content").and_then(Value::as_str)?;
             let status = normalize_todo_status(
-                item.get("status").and_then(Value::as_str).unwrap_or("pending"),
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending"),
             );
             Some(json!({
                 "content": content,
@@ -1451,11 +1451,7 @@ fn parse_todos_from_code_block(plan_text: &str) -> Option<Vec<Value>> {
             }))
         })
         .collect();
-    if todos.is_empty() {
-        None
-    } else {
-        Some(todos)
-    }
+    if todos.is_empty() { None } else { Some(todos) }
 }
 
 /// Strip the todos code block from plan markdown for cleaner saved files.
@@ -2377,10 +2373,11 @@ Some description here.
                 // Should only have the plan notification, no file-related messages.
                 assert_eq!(extra_notifications.len(), 1);
 
-                let plan_notif: Value =
-                    serde_json::from_str(&extra_notifications[0]).unwrap();
+                let plan_notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(
-                    plan_notif.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+                    plan_notif
+                        .pointer("/params/update/sessionUpdate")
+                        .and_then(Value::as_str),
                     Some("plan")
                 );
 
@@ -2428,10 +2425,16 @@ Some description here.
                 extra_notifications,
                 ..
             } => {
-                assert_eq!(extra_notifications.len(), 1, "should only emit plan notification");
+                assert_eq!(
+                    extra_notifications.len(),
+                    1,
+                    "should only emit plan notification"
+                );
                 let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(
-                    notif.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+                    notif
+                        .pointer("/params/update/sessionUpdate")
+                        .and_then(Value::as_str),
                     Some("plan")
                 );
             }
@@ -2462,7 +2465,9 @@ Some description here.
                 assert_eq!(extra_notifications.len(), 1);
                 let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(
-                    notif.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+                    notif
+                        .pointer("/params/update/sessionUpdate")
+                        .and_then(Value::as_str),
                     Some("plan")
                 );
             }
@@ -3189,8 +3194,7 @@ Some description here.
                         v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
                     })
                 });
-                let path = write_notif
-                    .expect("missing fs/write_text_file")["params"]["path"]
+                let path = write_notif.expect("missing fs/write_text_file")["params"]["path"]
                     .as_str()
                     .unwrap()
                     .to_string();

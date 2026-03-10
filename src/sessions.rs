@@ -120,6 +120,9 @@ impl SessionStore {
                 if let Err(e) = f.write_all(line.as_bytes()).await {
                     tracing::warn!(err = %e, "failed to append history");
                 }
+                if let Err(e) = f.sync_all().await {
+                    tracing::warn!(err = %e, "failed to sync history file");
+                }
             }
             Err(e) => tracing::warn!(err = %e, "failed to open history file"),
         }
