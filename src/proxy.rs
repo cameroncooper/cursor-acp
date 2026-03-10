@@ -110,7 +110,7 @@ impl ProxyState {
     }
 
     /// Generate a unique negative ID for internal proxy requests.
-    fn next_internal_id(&mut self) -> Value {
+    pub fn next_internal_id(&mut self) -> Value {
         self.internal_id_counter -= 1;
         json!(self.internal_id_counter)
     }
@@ -240,6 +240,12 @@ fn strip_meta_from_init(msg: &Value) -> String {
 
 fn handle_set_model(msg: &Value, state: &mut ProxyState) -> ClientAction {
     let id = &msg["id"];
+    if let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str) {
+        // Zed provides the sessionId here; capture it so we can recreate/remap
+        // the session after restarting the child with a different model.
+        state.zed_session_id = Some(session_id.to_string());
+        state.current_session_id = Some(session_id.to_string());
+    }
     let model_id = msg
         .pointer("/params/modelId")
         .and_then(Value::as_str)
@@ -248,6 +254,8 @@ fn handle_set_model(msg: &Value, state: &mut ProxyState) -> ClientAction {
 
     tracing::info!(model = %model_id, "model selection changed");
     state.selected_model = Some(model_id.clone());
+    // The child is about to restart; its current session (if any) becomes invalid.
+    state.child_session_id = None;
 
     let response = json!({
         "jsonrpc": "2.0",
@@ -1168,6 +1176,7 @@ mod tests {
     #[test]
     fn set_model_intercept() {
         let mut state = ProxyState::new();
+        state.child_session_id = Some("child-old".to_string());
         let msg = json!({
             "jsonrpc": "2.0",
             "id": 5,
@@ -1184,6 +1193,9 @@ mod tests {
                 assert_eq!(resp["id"], 5);
                 assert_eq!(restart_with_model, Some("opus-4.6-thinking".to_string()));
                 assert_eq!(state.selected_model.as_deref(), Some("opus-4.6-thinking"));
+                assert_eq!(state.zed_session_id.as_deref(), Some("s1"));
+                assert_eq!(state.current_session_id.as_deref(), Some("s1"));
+                assert!(state.child_session_id.is_none());
             }
             _ => panic!("expected Respond"),
         }

@@ -1,0 +1,111 @@
+name: Update Homebrew Tap
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  update-tap:
+    name: Update tap formula
+    runs-on: ubuntu-latest
+    environment: Release
+    steps:
+      - name: Extract release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "cursor-acp-${{ steps.version.outputs.version }}-*.tar.gz" \
+            --dir artifacts
+
+      - name: Compute artifact checksums
+        id: checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "mac_arm=$(shasum -a 256 "artifacts/cursor-acp-${VERSION}-aarch64-apple-darwin.tar.gz" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "mac_x64=$(shasum -a 256 "artifacts/cursor-acp-${VERSION}-x86_64-apple-darwin.tar.gz" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_arm=$(shasum -a 256 "artifacts/cursor-acp-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_x64=$(shasum -a 256 "artifacts/cursor-acp-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Homebrew tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: cameroncooper/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula file
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          mkdir -p tap/Formula
+          FORMULA="tap/Formula/cursor-acp.rb"
+
+          cat > "$FORMULA" <<EOF
+          class CursorAcp < Formula
+            desc "ACP proxy for Cursor CLI"
+            homepage "https://github.com/cameroncooper/cursor-acp"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/cameroncooper/cursor-acp/releases/download/${TAG}/cursor-acp-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${{ steps.checksums.outputs.mac_arm }}"
+              else
+                url "https://github.com/cameroncooper/cursor-acp/releases/download/${TAG}/cursor-acp-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${{ steps.checksums.outputs.mac_x64 }}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/cameroncooper/cursor-acp/releases/download/${TAG}/cursor-acp-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${{ steps.checksums.outputs.linux_arm }}"
+              else
+                url "https://github.com/cameroncooper/cursor-acp/releases/download/${TAG}/cursor-acp-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${{ steps.checksums.outputs.linux_x64 }}"
+              end
+            end
+
+            def install
+              bin.install "cursor-acp"
+            end
+
+            test do
+              assert_match "cursor-acp", shell_output("#{bin}/cursor-acp --help")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/cursor-acp.rb
+          git commit -m "cursor-acp ${{ steps.version.outputs.version }}" || exit 0
+          git push

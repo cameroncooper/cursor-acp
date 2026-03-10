@@ -26,7 +26,13 @@ Cursor ships a built-in ACP server (`cursor-agent acp`) that handles modes, auth
 
 Grab the archive for your platform from [GitHub Releases](https://github.com/cameroncooper/cursor-acp/releases), extract it, and place `cursor-acp` on your `PATH`.
 
-### Option B: Build from source
+### Option B: Install with Homebrew
+
+```bash
+brew install cameroncooper/tap/cursor-acp
+```
+
+### Option C: Build from source
 
 ```bash
 cargo install --git https://github.com/cameroncooper/cursor-acp --locked

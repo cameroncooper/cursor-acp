@@ -1,12 +1,10 @@
 name: Release
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      tag_name:
-        description: "Tag name for release (optional - uses version from Cargo.toml if not specified)"
-        required: false
-        type: string
 
 permissions:
   contents: write
@@ -15,31 +13,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  get-version:
-    name: Get Version
+  prepare-release:
+    name: Prepare Release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_version.outputs.version }}
       tag_name: ${{ steps.get_version.outputs.tag_name }}
+      release_sha: ${{ steps.release_commit.outputs.release_sha }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version from Cargo.toml
+      - name: Skip release commits
+        id: skip_check
+        run: |
+          if [ "${{ github.actor }}" = "github-actions[bot]" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next patch version
+        if: steps.skip_check.outputs.skip != 'true'
         id: get_version
         run: |
-          VERSION=$(grep -m1 "^version" Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
-            echo "tag_name=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=v$VERSION" >> $GITHUB_OUTPUT
+          CURRENT_VERSION=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n1)
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "Could not parse version from Cargo.toml"
+            exit 1
           fi
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          NEXT_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_name=v$NEXT_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Update distribution files with release version
+      - name: Update release metadata files
+        if: steps.skip_check.outputs.skip != 'true'
         run: |
           VERSION="${{ steps.get_version.outputs.version }}"
           TAG="${{ steps.get_version.outputs.tag_name }}"
           REPO="https://github.com/${{ github.repository }}"
+
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
 
           # Update extension.toml
           EXT="distribution/zed-extension/extension.toml"
@@ -54,21 +68,25 @@ jobs:
           echo "Updated distribution files to version ${VERSION} (tag ${TAG})"
           git diff --stat
 
-      - name: Commit distribution file updates
+      - name: Commit and tag release
+        if: steps.skip_check.outputs.skip != 'true'
+        id: release_commit
         run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="${{ steps.get_version.outputs.tag_name }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet; then
-            echo "No changes to commit"
-          else
-            git add distribution/
-            git commit -m "chore: update distribution files for v${{ steps.get_version.outputs.version }}"
-            git push
-          fi
+          git add Cargo.toml distribution/
+          git commit -m "chore(release): ${TAG} [skip ci]"
+          git tag "$TAG"
+          git push origin HEAD
+          git push origin "$TAG"
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build - ${{ matrix.os }}
-    needs: get-version
+    if: needs.prepare-release.outputs.release_sha != ''
+    needs: prepare-release
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +120,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -224,7 +244,7 @@ jobs:
         shell: bash
         run: |
           BINARY_NAME="cursor-acp${{ matrix.binary_extension }}"
-          ARCHIVE_NAME="cursor-acp-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
+          ARCHIVE_NAME="cursor-acp-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}"
 
           cd target/${{ matrix.target }}/release
 
@@ -249,11 +269,14 @@ jobs:
 
   create-release:
     name: Create Release
-    needs: [get-version, build]
+    if: needs.prepare-release.outputs.release_sha != ''
+    needs: [prepare-release, build]
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v5
@@ -266,8 +289,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ needs.get-version.outputs.tag_name }}
-          name: Release ${{ needs.get-version.outputs.version }}
+          tag_name: ${{ needs.prepare-release.outputs.tag_name }}
+          name: Release ${{ needs.prepare-release.outputs.version }}
           draft: false
           prerelease: false
           generate_release_notes: true

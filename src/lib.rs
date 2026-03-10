@@ -262,6 +262,54 @@ pub async fn run_main() -> Result<()> {
                                 for msg in replay_msgs {
                                     drop(current_to_child.send(msg));
                                 }
+
+                                // Recreate a child session after restart so subsequent
+                                // session-scoped requests (e.g., session/prompt) have
+                                // a valid context. Zed keeps using its existing session
+                                // ID; we remap it to the new child session ID.
+                                let (zed_sid, pending_cwd) = {
+                                    let st = stdin_state.lock().await;
+                                    let sid = st.zed_session_id.clone();
+                                    let cwd = sid
+                                        .as_ref()
+                                        .and_then(|s| st.pending_sessions.get(s).cloned());
+                                    (sid, cwd)
+                                };
+                                if let Some(zed_sid) = zed_sid {
+                                    let cwd = if let Some(cwd) = pending_cwd {
+                                        cwd
+                                    } else {
+                                        stdin_store
+                                            .list_sessions(None)
+                                            .await
+                                            .into_iter()
+                                            .find(|s| s.id == zed_sid)
+                                            .map(|s| s.cwd)
+                                            .unwrap_or_else(|| ".".to_string())
+                                    };
+
+                                    let req_id = {
+                                        let mut st = stdin_state.lock().await;
+                                        let id = st.next_internal_id();
+                                        st.suppress_response(id.clone());
+                                        id
+                                    };
+
+                                    let child_new_request = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "method": "session/new",
+                                        "params": {
+                                            "cwd": cwd,
+                                            "mcpServers": []
+                                        }
+                                    });
+                                    tracing::debug!(
+                                        session_id = %zed_sid,
+                                        "sending session/new to child after model restart"
+                                    );
+                                    drop(current_to_child.send(child_new_request.to_string()));
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(err = %e, "failed to restart child");
