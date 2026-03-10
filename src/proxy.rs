@@ -306,18 +306,16 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
             }
 
             // Detect plan mode and inject todos formatting instructions
-            if let Some(prompt_text) = extract_prompt_text(&patched) {
-                if prompt_text.to_lowercase().contains("plan mode") {
-                    if let Some(arr) = patched
-                        .pointer_mut("/params/prompt")
-                        .and_then(Value::as_array_mut)
-                    {
-                        arr.push(json!({
-                            "type": "text",
-                            "text": "<system_reminder>\nWhen calling CreatePlan, include todos as a JSON array in a fenced code block at the end of your plan markdown:\n\n```todos\n[{\"id\": \"task-1\", \"content\": \"First task\", \"status\": \"pending\"}, {\"id\": \"task-2\", \"content\": \"Second task\", \"status\": \"pending\"}]\n```\n\nThis ensures todos are preserved correctly. The `id` should be a short kebab-case identifier, `content` is the task description, and `status` should be \"pending\", \"in_progress\", or \"completed\".\n</system_reminder>"
-                        }));
-                    }
-                }
+            if let Some(prompt_text) = extract_prompt_text(&patched)
+                && prompt_text.to_lowercase().contains("plan mode")
+                && let Some(arr) = patched
+                    .pointer_mut("/params/prompt")
+                    .and_then(Value::as_array_mut)
+            {
+                arr.push(json!({
+                    "type": "text",
+                    "text": "<system_reminder>\nWhen calling CreatePlan, include todos as a JSON array in a fenced code block at the end of your plan markdown:\n\n```todos\n[{\"id\": \"task-1\", \"content\": \"First task\", \"status\": \"pending\"}, {\"id\": \"task-2\", \"content\": \"Second task\", \"status\": \"pending\"}]\n```\n\nThis ensures todos are preserved correctly. The `id` should be a short kebab-case identifier, `content` is the task description, and `status` should be \"pending\", \"in_progress\", or \"completed\".\n</system_reminder>"
+                }));
             }
 
             let forwarded = remap_client_session_id(&patched, state);
@@ -1143,10 +1141,10 @@ fn attach_plan_markdown_meta(
         }
     }
 
-    if meta.pointer("/cursor-acp/planName").is_none() {
-        if let Some(name) = state.session_first_prompt.get(session_id) {
-            meta["cursor-acp"]["planName"] = json!(name);
-        }
+    if meta.pointer("/cursor-acp/planName").is_none()
+        && let Some(name) = state.session_first_prompt.get(session_id)
+    {
+        meta["cursor-acp"]["planName"] = json!(name);
     }
 
     plan_update["_meta"] = meta;
