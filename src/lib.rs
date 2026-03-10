@@ -48,6 +48,16 @@ pub async fn run_main() -> Result<()> {
 
     let store = Arc::new(sessions::SessionStore::new().await);
 
+    // Periodic flush task: persist session index every 30s if dirty.
+    let flush_store = Arc::clone(&store);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            flush_store.flush_if_dirty().await;
+        }
+    });
+
     let (to_zed_tx, to_zed_rx) = mpsc::unbounded_channel::<String>();
 
     // Spawn initial child if possible. If not, we still start and let Zed prompt
@@ -457,6 +467,9 @@ pub async fn run_main() -> Result<()> {
     // Wait for stdin to close (Zed disconnected).
     drop(stdin_task.await);
     tracing::debug!("stdin task finished, draining child output");
+
+    // Flush session index on shutdown.
+    store.flush_if_dirty().await;
 
     // Give the child time to finish processing and produce output,
     // then wait for stdout to drain. If the child exits on its own

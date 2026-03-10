@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use regex::Regex;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -71,6 +72,12 @@ pub struct ProxyState {
     /// Pre-formatted conversation history to inject into the next `session/prompt`
     /// for a loaded session so the child agent gets context after a restart.
     pending_history_injection: HashMap<String, String>,
+    /// The first user prompt per session, used as a fallback plan file name
+    /// when no explicit plan name is available.
+    session_first_prompt: HashMap<String, String>,
+    /// Sessions for which we've already emitted the "Plan markdown saved to …"
+    /// chat message. Prevents re-injecting the notification on every streaming chunk.
+    plan_file_message_emitted: HashSet<String>,
     /// The workspace cwd for this proxy instance, learned from the first
     /// `session/new` request. Used to scope `session/list` to this workspace
     /// when the client doesn't provide a `cwd` filter.
@@ -154,6 +161,8 @@ impl ProxyState {
             internal_id_counter: -20000,
             pending_session_new_waiters: HashMap::new(),
             pending_history_injection: HashMap::new(),
+            session_first_prompt: HashMap::new(),
+            plan_file_message_emitted: HashSet::new(),
             workspace_cwd: None,
         }
     }
@@ -296,8 +305,29 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
                 );
             }
 
+            // Detect plan mode and inject todos formatting instructions
+            if let Some(prompt_text) = extract_prompt_text(&patched) {
+                if prompt_text.to_lowercase().contains("plan mode") {
+                    if let Some(arr) = patched
+                        .pointer_mut("/params/prompt")
+                        .and_then(Value::as_array_mut)
+                    {
+                        arr.push(json!({
+                            "type": "text",
+                            "text": "<system_reminder>\nWhen calling CreatePlan, include todos as a JSON array in a fenced code block at the end of your plan markdown:\n\n```todos\n[{\"id\": \"task-1\", \"content\": \"First task\", \"status\": \"pending\"}, {\"id\": \"task-2\", \"content\": \"Second task\", \"status\": \"pending\"}]\n```\n\nThis ensures todos are preserved correctly. The `id` should be a short kebab-case identifier, `content` is the task description, and `status` should be \"pending\", \"in_progress\", or \"completed\".\n</system_reminder>"
+                        }));
+                    }
+                }
+            }
+
             let forwarded = remap_client_session_id(&patched, state);
             if let Some(prompt_text) = extract_prompt_text(msg) {
+                if let Some(sid) = state.zed_session_id.as_deref() {
+                    state
+                        .session_first_prompt
+                        .entry(sid.to_string())
+                        .or_insert_with(|| prompt_text.clone());
+                }
                 ClientAction::ForwardWithPrompt {
                     line: forwarded,
                     prompt_text,
@@ -639,15 +669,19 @@ fn remap_session_id(msg: &Value, state: &ProxyState) -> Option<Value> {
     Some(patched)
 }
 
-/// When cursor-agent sends edit tool calls, synthesize `fs/read_text_file` and
-/// `fs/write_text_file` requests to Zed so its ActionLog tracks the changes
-/// (enabling the "Edits" panel with accept/reject all).
+/// When cursor-agent sends edit tool calls, synthesize `fs/read_text_file`
+/// requests to Zed so its ActionLog tracks the changes (enabling the "Edits"
+/// panel with accept/reject all).
 ///
 /// - On `tool_call` with `kind: "edit"` and `status: "pending"`: send
 ///   `fs/read_text_file` so Zed opens the buffer with the OLD content.
-/// - On `tool_call_update` with `status: "completed"` and diff content: send
-///   `fs/write_text_file` so Zed applies the new content against the cached old
-///   content, creating a tracked diff in the ActionLog.
+///
+/// We intentionally do NOT synthesize  We intentionally do NOT synthesize `fs/write_text_file` on
+/// `tool_call_update` — Cursor already sends its own write request for
+/// completed edits, and duplicating it causeson
+/// `tool_call_update` — Cursor already sends its own write request for
+/// completed edits, and duplicating it causes Zed to applyto apply the editedit twice,twice,
+/// corruptingcorrupting the bufferbuffer.
 fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<Vec<String>> {
     let update = msg.pointer("/params/update")?;
     let update_type = update.get("sessionUpdate")?.as_str()?;
@@ -719,46 +753,11 @@ fn maybe_synthesize_fs_for_edit(msg: &Value, state: &mut ProxyState) -> Option<V
             if reqs.is_empty() { None } else { Some(reqs) }
         }
         "tool_call_update" => {
-            if update.get("status").and_then(Value::as_str) != Some("completed") {
-                return None;
-            }
-            let content = update.get("content")?.as_array()?;
-
-            let mut reqs = Vec::new();
-            for item in content {
-                if item.get("type").and_then(Value::as_str) != Some("diff") {
-                    continue;
-                }
-                let raw_path = item.get("path").and_then(Value::as_str)?;
-                let new_text = item.get("newText").and_then(Value::as_str)?;
-                let path = match normalize_path_for_session(&session_id, raw_path, state) {
-                    Some(p) => p,
-                    None => {
-                        tracing::debug!(
-                            path = raw_path,
-                            "skipped fs/write_text_file; could not normalize path"
-                        );
-                        continue;
-                    }
-                };
-
-                let id = state.next_internal_id();
-                state.suppress_zed_response(id.clone());
-                let req = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": "fs/write_text_file",
-                    "params": {
-                        "sessionId": session_id,
-                        "path": path,
-                        "content": new_text,
-                    }
-                });
-                tracing::debug!(path, "synthesized fs/write_text_file for edit tracking");
-                reqs.push(req.to_string());
-            }
-
-            if reqs.is_empty() { None } else { Some(reqs) }
+            // Don't synthesize fs/write_text_file here — Cursor already sends
+            // its own fs/write_text_file for completed edits.  Synthesizing a
+            // duplicate causes Zed to apply the write twice, corrupting the
+            // buffer (token-level doubling).
+            None
         }
         _ => None,
     }
@@ -880,12 +879,17 @@ fn maybe_extract_plan_from_tool_call(msg: &Value, state: &mut ProxyState) -> Opt
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
 
-            let parsed = parse_plan_entries(plan_text);
+            // Parse todos: first try code block, then fall back to checklist parsing.
+            let parsed = parse_todos_from_code_block(plan_text)
+                .unwrap_or_else(|| parse_plan_entries(plan_text));
+
             if !parsed.is_empty() && !plan_text.trim().is_empty() {
+                // Strip the todos code block from saved markdown for cleaner files.
+                let clean_markdown = strip_todos_code_block(plan_text);
                 state.plans.insert(
                     session_id.clone(),
                     PlanInfo {
-                        markdown: plan_text.to_string(),
+                        markdown: clean_markdown,
                         name: plan_name,
                     },
                 );
@@ -1043,7 +1047,21 @@ fn maybe_extract_plan_from_agent_message(
     }
     state
         .last_detected_plan_markdown
-        .insert(session_id.clone(), derived_markdown);
+        .insert(session_id.clone(), derived_markdown.clone());
+
+    if !state.plans.contains_key(&session_id) {
+        let name = extract_markdown_heading(&accumulated)
+            .or_else(|| state.session_first_prompt.get(&session_id).cloned());
+        state.plans.insert(
+            session_id.clone(),
+            PlanInfo {
+                markdown: derived_markdown.clone(),
+                name,
+            },
+        );
+    } else if let Some(plan) = state.plans.get_mut(&session_id) {
+        plan.markdown = derived_markdown.clone();
+    }
 
     let mut plan_update = json!({
         "sessionUpdate": "plan",
@@ -1051,7 +1069,6 @@ fn maybe_extract_plan_from_agent_message(
     });
     attach_plan_markdown_meta(&mut plan_update, &session_id, "agent_message_chunk", state);
 
-    let plan_update_for_side_effects = plan_update.clone();
     let notification = json!({
       "jsonrpc": "2.0",
       "method": "session/update",
@@ -1061,14 +1078,9 @@ fn maybe_extract_plan_from_agent_message(
       }
     });
 
-    let mut notifications = vec![notification.to_string()];
-    if should_emit_plan_file_side_effects(state)
-        && let Some(mut extra) =
-            maybe_emit_plan_markdown_file(&session_id, update, &plan_update_for_side_effects, state)
-    {
-        notifications.append(&mut extra);
-    }
-    Some(notifications)
+    // Note: we intentionally do NOT emit plan files from agent message detection.
+    // Plan files are only created from explicit CreatePlan tool calls with a `plan` field.
+    Some(vec![notification.to_string()])
 }
 
 fn looks_like_planning_message(text: &str, entry_count: usize) -> bool {
@@ -1123,8 +1135,16 @@ fn attach_plan_markdown_meta(
     });
 
     if let Some(plan) = state.plans.get(session_id) {
-        meta["cursor-acp"]["planMarkdown"] = json!(plan.markdown.as_str());
+        if !plan.markdown.trim().is_empty() {
+            meta["cursor-acp"]["planMarkdown"] = json!(plan.markdown.as_str());
+        }
         if let Some(name) = &plan.name {
+            meta["cursor-acp"]["planName"] = json!(name);
+        }
+    }
+
+    if meta.pointer("/cursor-acp/planName").is_none() {
+        if let Some(name) = state.session_first_prompt.get(session_id) {
             meta["cursor-acp"]["planName"] = json!(name);
         }
     }
@@ -1248,7 +1268,12 @@ fn maybe_emit_plan_markdown_file(
         notifications.push(write_req.to_string());
     }
 
-    if state.emit_plan_file_messages {
+    if state.emit_plan_file_messages
+        && !state.plan_file_message_emitted.contains(session_id)
+    {
+        state
+            .plan_file_message_emitted
+            .insert(session_id.to_string());
         let abs_path = path.as_str();
         let file_url = format!(
             "file:///{}",
@@ -1358,6 +1383,20 @@ fn looks_like_same_plan(file_text: &str, needles: &[String], markdown: &str) -> 
     hits >= 2
 }
 
+/// Extract the first markdown heading (e.g. `## My Plan`) as a plan name.
+fn extract_markdown_heading(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let heading = rest.trim_start_matches('#').trim();
+            if !heading.is_empty() {
+                return Some(heading.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn sanitize_filename_component(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -1389,6 +1428,40 @@ fn encode_file_url_path(path: &str) -> String {
         }
     }
     out
+}
+
+/// Parse todos from a fenced code block in the plan markdown.
+/// Looks for: ```todos\n[...json...]\n```
+fn parse_todos_from_code_block(plan_text: &str) -> Option<Vec<Value>> {
+    let re = Regex::new(r"```todos\s*\n([\s\S]*?)\n```").ok()?;
+    let caps = re.captures(plan_text)?;
+    let json_str = caps.get(1)?.as_str();
+    let arr: Vec<Value> = serde_json::from_str(json_str).ok()?;
+    let todos: Vec<Value> = arr
+        .iter()
+        .filter_map(|item| {
+            let content = item.get("content").and_then(Value::as_str)?;
+            let status = normalize_todo_status(
+                item.get("status").and_then(Value::as_str).unwrap_or("pending"),
+            );
+            Some(json!({
+                "content": content,
+                "priority": "medium",
+                "status": status,
+            }))
+        })
+        .collect();
+    if todos.is_empty() {
+        None
+    } else {
+        Some(todos)
+    }
+}
+
+/// Strip the todos code block from plan markdown for cleaner saved files.
+fn strip_todos_code_block(plan_text: &str) -> String {
+    let re = Regex::new(r"\n?```todos\s*\n[\s\S]*?\n```\n?").unwrap();
+    re.replace(plan_text, "").trim().to_string()
 }
 
 /// Parse markdown list items into plan entries.
@@ -1509,6 +1582,16 @@ fn handle_update_todos(msg: &Value, state: &mut ProxyState) -> AgentAction {
             .collect();
 
         if !entries.is_empty() {
+            if !state.plans.contains_key(&session_id) {
+                let name = state.session_first_prompt.get(&session_id).cloned();
+                state.plans.insert(
+                    session_id.clone(),
+                    PlanInfo {
+                        markdown: String::new(),
+                        name,
+                    },
+                );
+            }
             let mut plan_update = json!({
                 "sessionUpdate": "plan",
                 "entries": entries,
@@ -1613,6 +1696,16 @@ pub fn parse_model_list(output: &str) -> Vec<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Returns a platform-appropriate absolute path for tests.
+    /// On Unix `/foo` is absolute; on Windows we need `C:\foo`.
+    fn test_abs(unix_path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", unix_path.replace('/', "\\"))
+        } else {
+            unix_path.to_string()
+        }
+    }
 
     #[test]
     fn forward_normal_notification() {
@@ -2179,6 +2272,35 @@ Tip: use --model <id> to switch.
     }
 
     #[test]
+    fn parse_todos_from_code_block_json() {
+        let plan = r#"# My Plan
+
+Some description here.
+
+- [ ] Fake checklist item (should be ignored)
+
+```todos
+[{"id": "task-1", "content": "First real task", "status": "pending"}, {"id": "task-2", "content": "Second task", "status": "in_progress"}]
+```
+"#;
+        let entries = parse_todos_from_code_block(plan).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["content"], "First real task");
+        assert_eq!(entries[0]["status"], "pending");
+        assert_eq!(entries[1]["content"], "Second task");
+        assert_eq!(entries[1]["status"], "in_progress");
+    }
+
+    #[test]
+    fn strip_todos_code_block_cleans_markdown() {
+        let plan = "# My Plan\n\nDescription.\n\n```todos\n[{\"id\": \"t1\", \"content\": \"Task\"}]\n```\n";
+        let clean = strip_todos_code_block(plan);
+        assert!(!clean.contains("```todos"));
+        assert!(clean.contains("# My Plan"));
+        assert!(clean.contains("Description."));
+    }
+
+    #[test]
     fn detect_plan_from_agent_message_checklist() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
@@ -2219,14 +2341,17 @@ Tip: use --model <id> to switch.
     }
 
     #[test]
-    fn detect_plan_from_agent_message_can_emit_plan_file_message() {
+    fn detect_plan_from_agent_message_does_not_emit_plan_file() {
+        // Agent message detection should emit a plan notification but NOT
+        // plan file messages. Plan files are only created from explicit
+        // CreatePlan tool calls.
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
         state.current_session_id = Some("zed-sess".to_string());
         state
             .session_cwds
-            .insert("zed-sess".to_string(), "/tmp".to_string());
-        state.emit_plan_files = false;
+            .insert("zed-sess".to_string(), test_abs("/tmp"));
+        state.emit_plan_files = true;
         state.emit_plan_file_messages = true;
 
         let msg = json!({
@@ -2249,33 +2374,99 @@ Tip: use --model <id> to switch.
                 extra_notifications,
                 ..
             } => {
-                assert_eq!(extra_notifications.len(), 2);
+                // Should only have the plan notification, no file-related messages.
+                assert_eq!(extra_notifications.len(), 1);
 
-                let has_write = extra_notifications.iter().any(|s| {
+                let plan_notif: Value =
+                    serde_json::from_str(&extra_notifications[0]).unwrap();
+                assert_eq!(
+                    plan_notif.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+                    Some("plan")
+                );
+
+                let has_file_write = extra_notifications.iter().any(|s| {
                     serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
                         v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
                     })
                 });
-                assert!(!has_write, "message-only mode should not write file");
-
-                let msg_ix = extra_notifications
-                    .iter()
-                    .position(|s| {
-                        serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
-                            v.pointer("/params/update/sessionUpdate")
-                                .and_then(Value::as_str)
-                                == Some("agent_message_chunk")
-                        })
-                    })
-                    .expect("missing plan file message notification");
-                let msg_notif: Value = serde_json::from_str(&extra_notifications[msg_ix]).unwrap();
-                let text = msg_notif
-                    .pointer("/params/update/content/text")
-                    .and_then(Value::as_str)
-                    .unwrap();
-                assert!(text.contains("Plan markdown saved to file:///"));
+                assert!(!has_file_write, "agent messages should not emit plan files");
             }
             _ => panic!("expected ForwardWithExtra"),
+        }
+    }
+
+    #[test]
+    fn agent_message_plan_updates_only_emit_plan_notification() {
+        // When agent messages are detected as plans, they should only emit
+        // plan notifications, never file write requests or "saved" messages.
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), test_abs("/tmp"));
+        state.emit_plan_files = true;
+        state.emit_plan_file_messages = true;
+
+        let msg1 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "## Plan\n\n- [ ] Step one\n- [ ] Step two"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg1, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 1, "should only emit plan notification");
+                let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                assert_eq!(
+                    notif.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+                    Some("plan")
+                );
+            }
+            _ => panic!("expected ForwardWithExtra"),
+        }
+
+        // Second message with more steps should also only produce plan notification.
+        let msg2 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "\n- [ ] Step three"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg2, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                assert_eq!(extra_notifications.len(), 1);
+                let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                assert_eq!(
+                    notif.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+                    Some("plan")
+                );
+            }
+            _ => panic!("expected ForwardWithExtra on second call"),
         }
     }
 
@@ -2424,7 +2615,7 @@ Tip: use --model <id> to switch.
         state.current_session_id = Some("zed-sess".to_string());
         state
             .session_cwds
-            .insert("zed-sess".to_string(), "/tmp".to_string());
+            .insert("zed-sess".to_string(), test_abs("/tmp"));
         state.emit_plan_files = true;
         state.emit_plan_file_messages = true;
 
@@ -2516,7 +2707,7 @@ Tip: use --model <id> to switch.
         state.current_session_id = Some("zed-sess".to_string());
         state
             .session_cwds
-            .insert("zed-sess".to_string(), "/tmp".to_string());
+            .insert("zed-sess".to_string(), test_abs("/tmp"));
         state.emit_plan_files = false;
         state.emit_plan_file_messages = true;
 
@@ -2694,7 +2885,7 @@ Tip: use --model <id> to switch.
         state.current_session_id = Some("zed-id".to_string());
         state
             .session_cwds
-            .insert("zed-id".to_string(), "/tmp".to_string());
+            .insert("zed-id".to_string(), test_abs("/tmp"));
         state.emit_plan_files = false;
         state.emit_plan_file_messages = true;
 
@@ -2729,6 +2920,7 @@ Tip: use --model <id> to switch.
     fn synthesize_read_for_edit_tool_call() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
+        let abs_path = test_abs("/tmp/foo.txt");
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -2738,11 +2930,11 @@ Tip: use --model <id> to switch.
                 "update": {
                     "sessionUpdate": "tool_call",
                     "toolCallId": "tc-1",
-                    "title": "Edit `/tmp/foo.txt`",
+                    "title": format!("Edit `{abs_path}`"),
                     "kind": "edit",
                     "status": "pending",
-                    "rawInput": { "path": "/tmp/foo.txt" },
-                    "locations": [{ "path": "/tmp/foo.txt" }]
+                    "rawInput": { "path": &abs_path },
+                    "locations": [{ "path": &abs_path }]
                 }
             }
         });
@@ -2756,7 +2948,7 @@ Tip: use --model <id> to switch.
                 let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(req["method"], "fs/read_text_file");
                 assert_eq!(req["params"]["sessionId"], "zed-sess");
-                assert_eq!(req["params"]["path"], "/tmp/foo.txt");
+                assert_eq!(req["params"]["path"], abs_path);
                 assert!(req["id"].as_i64().unwrap() < -20000);
             }
             _ => panic!("expected ForwardWithExtra with read request"),
@@ -2768,9 +2960,14 @@ Tip: use --model <id> to switch.
     fn synthesize_read_normalizes_relative_paths_using_session_cwd() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
+        let cwd = test_abs("/work");
         state
             .session_cwds
-            .insert("zed-sess".to_string(), "/work".to_string());
+            .insert("zed-sess".to_string(), cwd.clone());
+        let expected = PathBuf::from(&cwd)
+            .join("src/foo.md")
+            .to_string_lossy()
+            .into_owned();
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -2797,16 +2994,17 @@ Tip: use --model <id> to switch.
                 assert_eq!(extra_notifications.len(), 1);
                 let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 assert_eq!(req["method"], "fs/read_text_file");
-                assert_eq!(req["params"]["path"], "/work/src/foo.md");
+                assert_eq!(req["params"]["path"], expected);
             }
             _ => panic!("expected ForwardWithExtra"),
         }
     }
 
     #[test]
-    fn synthesize_write_for_completed_edit() {
+    fn no_synthesize_write_for_completed_edit() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
+        let abs_path = test_abs("/tmp/foo.txt");
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -2819,7 +3017,7 @@ Tip: use --model <id> to switch.
                     "status": "completed",
                     "content": [{
                         "type": "diff",
-                        "path": "/tmp/foo.txt",
+                        "path": &abs_path,
                         "oldText": "old content",
                         "newText": "new content"
                     }]
@@ -2828,62 +3026,10 @@ Tip: use --model <id> to switch.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra {
-                extra_notifications,
-                ..
-            } => {
-                assert_eq!(extra_notifications.len(), 1);
-                let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
-                assert_eq!(req["method"], "fs/write_text_file");
-                assert_eq!(req["params"]["sessionId"], "zed-sess");
-                assert_eq!(req["params"]["path"], "/tmp/foo.txt");
-                assert_eq!(req["params"]["content"], "new content");
-            }
-            _ => panic!("expected ForwardWithExtra with write request"),
+            AgentAction::Forward => {}
+            _ => panic!("expected Forward (no synthesized write for completed edits)"),
         }
-        assert_eq!(state.suppress_zed_response_ids.len(), 1);
-    }
-
-    #[test]
-    fn synthesize_write_normalizes_relative_paths_using_session_cwd() {
-        let mut state = ProxyState::new();
-        state.zed_session_id = Some("zed-sess".to_string());
-        state
-            .session_cwds
-            .insert("zed-sess".to_string(), "/work".to_string());
-
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "zed-sess",
-                "update": {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "tc-1",
-                    "status": "completed",
-                    "content": [{
-                        "type": "diff",
-                        "path": "src/foo.md",
-                        "oldText": "old",
-                        "newText": "new"
-                    }]
-                }
-            }
-        });
-
-        match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra {
-                extra_notifications,
-                ..
-            } => {
-                assert_eq!(extra_notifications.len(), 1);
-                let req: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
-                assert_eq!(req["method"], "fs/write_text_file");
-                assert_eq!(req["params"]["path"], "/work/src/foo.md");
-                assert_eq!(req["params"]["content"], "new");
-            }
-            _ => panic!("expected ForwardWithExtra with write request"),
-        }
+        assert!(state.suppress_zed_response_ids.is_empty());
     }
 
     #[test]
@@ -2931,5 +3077,129 @@ Tip: use --model <id> to switch.
             _ => panic!("expected Drop for suppressed response"),
         }
         assert!(state.suppress_zed_response_ids.is_empty());
+    }
+
+    #[test]
+    fn extract_markdown_heading_basic() {
+        assert_eq!(
+            extract_markdown_heading("## My Plan\n\n- [ ] Step one"),
+            Some("My Plan".to_string())
+        );
+        assert_eq!(
+            extract_markdown_heading("# Fix the Bug\n- do stuff"),
+            Some("Fix the Bug".to_string())
+        );
+        assert_eq!(
+            extract_markdown_heading("### Deeply Nested\ntext"),
+            Some("Deeply Nested".to_string())
+        );
+        assert_eq!(
+            extract_markdown_heading("- [ ] No heading here\n- [ ] Just items"),
+            None
+        );
+        assert_eq!(extract_markdown_heading(""), None);
+    }
+
+    #[test]
+    fn agent_message_plan_extracts_heading_into_meta() {
+        // Agent message detection should extract the markdown heading as planName
+        // in the meta, but should NOT emit file writes.
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), test_abs("/tmp"));
+        state.emit_plan_files = true;
+        state.emit_plan_file_messages = true;
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "## Fix Edit Bug\n\n- [ ] Find root cause\n- [ ] Apply fix\n- [ ] Test"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardWithExtra {
+                extra_notifications,
+                ..
+            } => {
+                // Should not have any file write requests.
+                let has_write = extra_notifications.iter().any(|s| {
+                    serde_json::from_str::<Value>(s).ok().is_some_and(|v| {
+                        v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
+                    })
+                });
+                assert!(!has_write, "agent messages should not emit file writes");
+
+                // The plan notification should have the heading in meta.
+                let plan_notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                let plan_name = plan_notif
+                    .pointer("/params/update/_meta/cursor-acp/planName")
+                    .and_then(Value::as_str);
+                assert_eq!(plan_name, Some("Fix Edit Bug"));
+            }
+            _ => panic!("expected ForwardWithExtra"),
+        }
+    }
+
+    #[test]
+    fn update_todos_plan_file_uses_prompt_fallback_name() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state.current_session_id = Some("zed-sess".to_string());
+        state
+            .session_cwds
+            .insert("zed-sess".to_string(), test_abs("/tmp"));
+        state.emit_plan_files = true;
+        state.emit_plan_file_messages = true;
+        state
+            .session_first_prompt
+            .insert("zed-sess".to_string(), "fix the doubling bug".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "_cursor/update_todos",
+            "params": {
+                "todos": [
+                    { "id": "1", "content": "Find root cause", "status": "pending" },
+                    { "id": "2", "content": "Apply fix", "status": "pending" }
+                ],
+                "merge": false
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::Intercept {
+                notifications_to_zed,
+                ..
+            } => {
+                let write_notif = notifications_to_zed.iter().find_map(|s| {
+                    serde_json::from_str::<Value>(s).ok().filter(|v| {
+                        v.get("method").and_then(Value::as_str) == Some("fs/write_text_file")
+                    })
+                });
+                let path = write_notif
+                    .expect("missing fs/write_text_file")["params"]["path"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert!(
+                    path.contains("fix-the-doubling-bug"),
+                    "expected prompt text in filename, got: {path}"
+                );
+            }
+            _ => panic!("expected Intercept"),
+        }
     }
 }
