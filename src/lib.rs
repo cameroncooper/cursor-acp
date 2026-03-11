@@ -44,19 +44,23 @@ pub async fn run_main() -> Result<()> {
         );
     }
 
-    let models = if binary_available {
-        let models = fetch_models(&binary).await;
-        tracing::info!(count = models.len(), "loaded models");
-        models
-    } else {
-        Vec::new()
-    };
-
     let state = Arc::new(Mutex::new(proxy::ProxyState::new()));
     {
         let mut st = state.lock().await;
-        st.models = models;
         st.agent_binary = Some(binary.clone());
+    }
+
+    // Fetch models in the background so we don't block stdin reading.
+    // Models are only needed when patching session/new and session/load
+    // responses, which happen well after the initialize handshake.
+    if binary_available {
+        let models_state = Arc::clone(&state);
+        let models_binary = binary.clone();
+        tokio::spawn(async move {
+            let models = fetch_models(&models_binary).await;
+            tracing::info!(count = models.len(), "loaded models");
+            models_state.lock().await.models = models;
+        });
     }
 
     let store = Arc::new(sessions::SessionStore::new().await);
