@@ -18,7 +18,7 @@ path = "src/lib.rs"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "sync", "time", "fs", "net"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 regex = "1"

@@ -92,6 +92,24 @@ pub struct ProxyState {
     /// JSON-RPC line. Once the command arrives, we discard the buffer and
     /// forward only the patched version.
     buffered_execute_tool_calls: HashMap<String, Value>,
+
+    // --- PTY streaming ---
+    /// Pending matches: command substring → (terminal_id, tool_call_id, session_id).
+    /// Populated when we see a tool_call with kind=execute and a command.
+    /// Consumed when a PTY stream spawn arrives with a matching command.
+    pub pty_pending_matches: Vec<PtyStreamMatch>,
+    /// Active streaming PTYs: child PID → terminal routing info.
+    pub pty_stream_pids: HashMap<i32, PtyStreamMatch>,
+    /// Terminal IDs that received streaming output (skip batch output on completion).
+    pub pty_streamed_terminals: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PtyStreamMatch {
+    pub terminal_id: String,
+    pub tool_call_id: String,
+    pub session_id: String,
+    pub command: String,
 }
 
 struct TodoItem {
@@ -189,6 +207,9 @@ impl ProxyState {
             workspace_cwd: None,
             terminal_ids: HashMap::new(),
             buffered_execute_tool_calls: HashMap::new(),
+            pty_pending_matches: Vec::new(),
+            pty_stream_pids: HashMap::new(),
+            pty_streamed_terminals: HashSet::new(),
         }
     }
 
@@ -812,6 +833,25 @@ fn maybe_synthesize_terminal_for_execute(
             // it in a markdown code block, so we must not add backticks here.
             patch_update["title"] = json!(command);
 
+            // Record for PTY stream matching so we can correlate the
+            // streaming spawn notification with this tool call.
+            let session_id = msg
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let tc_id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            state.pty_pending_matches.push(PtyStreamMatch {
+                terminal_id: terminal_id.clone(),
+                tool_call_id: tc_id,
+                session_id,
+                command: command.to_string(),
+            });
+
             tracing::debug!(
                 terminal_id = terminal_id.as_str(),
                 command,
@@ -841,16 +881,21 @@ fn maybe_synthesize_terminal_for_execute(
                 .unwrap_or("");
             let exit_code = raw_output.get("exitCode").and_then(Value::as_u64);
 
-            // Combine stdout + stderr for the terminal display.
+            // If we already streamed this terminal's output in real-time,
+            // skip the batch output to avoid duplicates.
+            let already_streamed = state.pty_streamed_terminals.remove(&terminal_id);
+
             let mut output = String::new();
-            if !stdout.is_empty() {
-                output.push_str(stdout);
-            }
-            if !stderr.is_empty() {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
+            if !already_streamed {
+                if !stdout.is_empty() {
+                    output.push_str(stdout);
                 }
-                output.push_str(stderr);
+                if !stderr.is_empty() {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(stderr);
+                }
             }
 
             let mut patched = msg.clone();
@@ -889,6 +934,52 @@ fn maybe_synthesize_terminal_for_execute(
         }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// PTY streaming helpers
+// ---------------------------------------------------------------------------
+
+/// Try to match a PTY spawn notification (from the pty-proxy addon) to a
+/// pending execute tool call.  Returns the match if found.
+pub fn match_pty_spawn(state: &mut ProxyState, pid: i32, cmd: &str) -> Option<PtyStreamMatch> {
+    let pos = state
+        .pty_pending_matches
+        .iter()
+        .position(|m| cmd.contains(&m.command) || m.command.contains(cmd));
+    if let Some(idx) = pos {
+        let matched = state.pty_pending_matches.remove(idx);
+        state.pty_stream_pids.insert(pid, matched.clone());
+        tracing::debug!(pid, terminal_id = %matched.terminal_id, "matched PTY stream to terminal");
+        Some(matched)
+    } else {
+        // No match yet — store for later matching when tool_call arrives.
+        tracing::debug!(pid, cmd, "PTY spawn received but no pending match");
+        None
+    }
+}
+
+/// Build a `session/update` notification that delivers streaming terminal output.
+pub fn build_streaming_terminal_output(info: &PtyStreamMatch, data: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": info.session_id,
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": info.tool_call_id,
+                "status": "in_progress",
+                "_meta": {
+                    "terminal_output": {
+                        "terminal_id": info.terminal_id,
+                        "data": data,
+                    }
+                }
+            }
+        }
+    })
+    .to_string()
 }
 
 /// When cursor-agent sends `session/request_permission` for an execute tool call,
