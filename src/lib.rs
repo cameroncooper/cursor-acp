@@ -593,7 +593,7 @@ fn bootstrap_initialize_response(request_id: &Value, command: &str, args: &[Stri
             "agentCapabilities": {
                 "loadSession": true,
                 "mcpCapabilities": { "http": true, "sse": true },
-                "promptCapabilities": { "audio": false, "embeddedContext": false, "image": true },
+                "promptCapabilities": { "audio": false, "embeddedContext": true, "image": true },
                 "sessionCapabilities": { "list": {} }
             },
             "authMethods": [{
