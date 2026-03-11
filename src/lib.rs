@@ -22,6 +22,17 @@ pub async fn run_main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Ensure ~/.claude/ exists so cursor-agent can persist its allowlist
+    // (used for "always allow" permission decisions).
+    if let Some(home) = dirs_home() {
+        let claude_dir = home.join(".claude");
+        if !claude_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(&claude_dir)
+        {
+            tracing::warn!(path = %claude_dir.display(), err = %e, "failed to create .claude dir");
+        }
+    }
+
     let binary = resolve_agent_binary();
     tracing::info!(binary = %binary, "starting cursor-acp proxy");
 

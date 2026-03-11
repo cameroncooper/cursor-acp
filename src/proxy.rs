@@ -1,10 +1,25 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use regex::Regex;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
+
+fn perm_log(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/cursor-acp-permissions.log")
+    {
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        drop(writeln!(f, "[{ts}] {msg}"));
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ModelInfo {
@@ -102,6 +117,16 @@ pub struct ProxyState {
     pub pty_stream_pids: HashMap<i32, PtyStreamMatch>,
     /// Terminal IDs that received streaming output (skip batch output on completion).
     pub pty_streamed_terminals: HashSet<String>,
+
+    // --- Permission caching ---
+    /// Tool kinds (e.g. "execute", "edit") for which the user has chosen
+    /// "allow-always". When a new permission request arrives for a cached kind,
+    /// the proxy auto-responds without prompting Zed.
+    pub allowed_tool_kinds: HashSet<String>,
+    /// Maps JSON-RPC request IDs for in-flight `session/request_permission`
+    /// requests to (tool_kind, allow_always_option_id) so we can recognize
+    /// allow-always responses when they come back from Zed.
+    pending_permission_requests: HashMap<String, PendingPermission>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +135,12 @@ pub struct PtyStreamMatch {
     pub tool_call_id: String,
     pub session_id: String,
     pub command: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPermission {
+    tool_kind: String,
+    allow_always_option_id: Option<String>,
 }
 
 struct TodoItem {
@@ -210,6 +241,8 @@ impl ProxyState {
             pty_pending_matches: Vec::new(),
             pty_stream_pids: HashMap::new(),
             pty_streamed_terminals: HashSet::new(),
+            allowed_tool_kinds: HashSet::new(),
+            pending_permission_requests: HashMap::new(),
         }
     }
 
@@ -291,6 +324,26 @@ fn parse_env_flag(raw: Option<&str>, default: bool) -> bool {
 
 /// Inspect a JSON-RPC message from Zed and decide what to do with it.
 pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientAction {
+    // Broad logging: capture every Zed message for debugging permissions.
+    if let Some(method) = msg.get("method").and_then(Value::as_str) {
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
+        perm_log(&format!(
+            "ZED MSG method={method} id={id} has_params={}",
+            msg.get("params").is_some()
+        ));
+    } else if msg.get("result").is_some() || msg.get("error").is_some() {
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
+        let has_option = msg.pointer("/result/outcome/optionId").is_some();
+        perm_log(&format!(
+            "ZED MSG response id={id} has_result={} has_error={} has_optionId={has_option}",
+            msg.get("result").is_some(),
+            msg.get("error").is_some()
+        ));
+    }
+
+    // Check if this is a permission response and cache allow-always decisions.
+    maybe_cache_permission_response(msg, state);
+
     // Suppress responses to our synthesized fs/ requests.
     if let Some(id) = msg.get("id")
         && (msg.get("result").is_some() || msg.get("error").is_some())
@@ -463,6 +516,21 @@ fn handle_set_model(msg: &Value, state: &mut ProxyState) -> ClientAction {
 
 /// Inspect a JSON-RPC message from `agent acp` and decide what to do.
 pub fn process_agent_message(msg: &Value, state: &mut ProxyState) -> AgentAction {
+    // Broad logging: capture every agent message method for debugging permissions.
+    if let Some(method) = msg.get("method").and_then(Value::as_str) {
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
+        perm_log(&format!(
+            "AGENT MSG method={method} id={id} has_params={}",
+            msg.get("params").is_some()
+        ));
+    } else if msg.get("result").is_some() || msg.get("error").is_some() {
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
+        perm_log(&format!(
+            "AGENT MSG response id={id} has_result={} has_error={}",
+            msg.get("result").is_some(),
+            msg.get("error").is_some()
+        ));
+    }
     // Suppress responses to replayed init/auth after child restart.
     if let Some(id) = msg.get("id")
         && (msg.get("result").is_some() || msg.get("error").is_some())
@@ -532,6 +600,16 @@ pub fn process_agent_message(msg: &Value, state: &mut ProxyState) -> AgentAction
     if let Some(action) = maybe_synthesize_terminal_for_execute(msg, state) {
         return action;
     }
+
+    // Auto-respond to permission requests for tool kinds the user already
+    // "always allowed" in this session (cached in allowed_tool_kinds).
+    if let Some(action) = maybe_auto_approve_permission(msg, state) {
+        return action;
+    }
+
+    // Track permission requests being forwarded to Zed so we can detect
+    // allow-always responses and cache the tool kind.
+    track_pending_permission_request(msg, state);
 
     // Inject terminal content into session/request_permission so Zed renders
     // the terminal UI even for commands that need user approval.
@@ -980,6 +1058,156 @@ pub fn build_streaming_terminal_output(info: &PtyStreamMatch, data: &str) -> Str
         }
     })
     .to_string()
+}
+
+/// Auto-respond to `session/request_permission` if the user previously chose
+/// "allow-always" for this tool kind in the current session. Returns an
+/// `Intercept` action that sends the approval response to the child and a
+/// `session/update` notification to Zed (so Zed shows the tool as in-progress
+/// rather than stuck waiting for permission).
+fn maybe_auto_approve_permission(msg: &Value, state: &ProxyState) -> Option<AgentAction> {
+    let method = msg.get("method").and_then(Value::as_str)?;
+    if method != "session/request_permission" {
+        return None;
+    }
+    let request_id = msg.get("id")?;
+
+    let tool_kind = msg
+        .pointer("/params/toolCall/kind")
+        .and_then(Value::as_str)?;
+
+    perm_log(&format!(
+        "request_permission id={request_id} kind={tool_kind:?} cached_kinds={:?}",
+        state.allowed_tool_kinds
+    ));
+
+    if !state.allowed_tool_kinds.contains(tool_kind) {
+        perm_log("  -> NOT cached, forwarding to Zed");
+        return None;
+    }
+
+    // Find the allow-always option ID from the options list.
+    let options = msg.pointer("/params/options").and_then(Value::as_array)?;
+    let option_id = options.iter().find_map(|opt| {
+        let kind = opt.get("kind").and_then(Value::as_str)?;
+        if kind == "allow_always" {
+            opt.get("optionId")
+                .and_then(Value::as_str)
+                .map(String::from)
+        } else {
+            None
+        }
+    })?;
+
+    perm_log(&format!(
+        "  -> AUTO-APPROVE kind={tool_kind:?} option_id={option_id:?}"
+    ));
+    tracing::info!(
+        tool_kind,
+        option_id = option_id.as_str(),
+        "auto-approving permission (cached allow-always)"
+    );
+
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id
+            }
+        }
+    });
+
+    Some(AgentAction::Intercept {
+        response_to_child: Some(response.to_string()),
+        notifications_to_zed: vec![],
+    })
+}
+
+/// Record a pending permission request so we can detect the allow-always
+/// response from Zed and cache the tool kind.
+fn track_pending_permission_request(msg: &Value, state: &mut ProxyState) {
+    let method = msg.get("method").and_then(Value::as_str);
+    if method != Some("session/request_permission") {
+        return;
+    }
+
+    let request_id = match msg.get("id") {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    let tool_kind = msg
+        .pointer("/params/toolCall/kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let allow_always_option_id = msg
+        .pointer("/params/options")
+        .and_then(Value::as_array)
+        .and_then(|opts| {
+            opts.iter().find_map(|opt| {
+                let kind = opt.get("kind").and_then(Value::as_str)?;
+                if kind == "allow_always" {
+                    opt.get("optionId")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                } else {
+                    None
+                }
+            })
+        });
+
+    state.pending_permission_requests.insert(
+        request_id,
+        PendingPermission {
+            tool_kind,
+            allow_always_option_id,
+        },
+    );
+}
+
+/// When Zed responds to a `session/request_permission` with the allow-always
+/// option, cache the tool kind so future requests are auto-approved.
+pub fn maybe_cache_permission_response(msg: &Value, state: &mut ProxyState) {
+    // Only look at JSON-RPC responses (have `id` + `result`).
+    if msg.get("method").is_some() || msg.get("result").is_none() {
+        return;
+    }
+    let request_id = match msg.get("id") {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    let pending = match state.pending_permission_requests.remove(&request_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    perm_log(&format!(
+        "permission_response id={request_id} tool_kind={:?} always_opt={:?} response={msg}",
+        pending.tool_kind, pending.allow_always_option_id,
+    ));
+
+    let selected_option_id = msg
+        .pointer("/result/outcome/optionId")
+        .and_then(Value::as_str);
+
+    if let (Some(selected), Some(always_id)) = (selected_option_id, &pending.allow_always_option_id)
+        && selected == always_id
+    {
+        perm_log(&format!(
+            "  -> CACHING allow-always for kind={:?}",
+            pending.tool_kind
+        ));
+        tracing::info!(
+            tool_kind = pending.tool_kind.as_str(),
+            "caching allow-always for tool kind"
+        );
+        state.allowed_tool_kinds.insert(pending.tool_kind);
+    }
 }
 
 /// When cursor-agent sends `session/request_permission` for an execute tool call,
