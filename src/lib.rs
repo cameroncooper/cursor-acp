@@ -1,12 +1,13 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
@@ -60,10 +61,13 @@ pub async fn run_main() -> Result<()> {
 
     let (to_zed_tx, to_zed_rx) = mpsc::unbounded_channel::<String>();
 
+    // Set up PTY streaming if the helper addon and interceptor are available.
+    let pty_env = setup_pty_streaming(Arc::clone(&state), to_zed_tx.clone());
+
     // Spawn initial child if possible. If not, we still start and let Zed prompt
     // the user to install Cursor CLI.
     let initial_child = if binary_available {
-        match spawn_child(&binary, None) {
+        match spawn_child(&binary, None, &pty_env) {
             Ok(child) => Some(child),
             Err(e) => {
                 tracing::warn!(err = %e, "failed to spawn initial agent; will run without child");
@@ -84,6 +88,7 @@ pub async fn run_main() -> Result<()> {
     let stdin_child_handle = Arc::clone(&child_handle);
     let stdin_store = Arc::clone(&store);
     let binary_for_restart = binary.clone();
+    let pty_env_for_restart = pty_env.clone();
     let stdin_task = tokio::spawn(async move {
         let reader = BufReader::new(tokio::io::stdin());
         let mut lines = reader.lines();
@@ -339,7 +344,7 @@ pub async fn run_main() -> Result<()> {
                         }
 
                         // Spawn new child.
-                        match spawn_child(&binary_for_restart, Some(&model)) {
+                        match spawn_child(&binary_for_restart, Some(&model), &pty_env_for_restart) {
                             Ok(new_child) => {
                                 *stdin_child_handle.lock().await = Some(new_child);
 
@@ -693,7 +698,11 @@ fn probe_cursor_agent_paths() -> Option<String> {
     None
 }
 
-fn spawn_child(binary: &str, model: Option<&str>) -> Result<Child> {
+fn spawn_child(
+    binary: &str,
+    model: Option<&str>,
+    pty_env: &Option<PtyStreamingEnv>,
+) -> Result<Child> {
     let mut cmd = build_command(binary);
     cmd.arg("acp")
         .stdin(Stdio::piped())
@@ -704,10 +713,27 @@ fn spawn_child(binary: &str, model: Option<&str>) -> Result<Child> {
         cmd.arg("--model").arg(m);
     }
 
+    if let Some(env) = pty_env {
+        cmd.env("CURSOR_ACP_PTY_SOCK", &env.sock_path);
+
+        let node_opts = format!("--require={}", env.interceptor_path.display());
+        if let Ok(existing) = std::env::var("NODE_OPTIONS") {
+            cmd.env("NODE_OPTIONS", format!("{existing} {node_opts}"));
+        } else {
+            cmd.env("NODE_OPTIONS", node_opts);
+        }
+    }
+
     let child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn `{binary} acp`"))?;
     Ok(child)
+}
+
+#[derive(Clone)]
+struct PtyStreamingEnv {
+    sock_path: String,
+    interceptor_path: PathBuf,
 }
 
 /// Build a `Command` that handles `.ps1` scripts on Windows by invoking
@@ -874,6 +900,166 @@ async fn write_stdout(mut rx: mpsc::UnboundedReceiver<String>) {
         }
     }
     tracing::debug!("stdout writer done");
+}
+
+// ---------------------------------------------------------------------------
+// PTY streaming: intercept node-pty output for real-time terminal display
+// ---------------------------------------------------------------------------
+
+const PTY_INTERCEPTOR_JS: &str = include_str!("../resources/pty-interceptor.js");
+
+/// Write the embedded interceptor script to disk and set up the streaming socket.
+/// Returns `None` on failure (streaming is disabled).
+fn setup_pty_streaming(
+    state: Arc<Mutex<proxy::ProxyState>>,
+    to_zed: mpsc::UnboundedSender<String>,
+) -> Option<PtyStreamingEnv> {
+    let data_dir = dirs_data_dir()?.join("cursor-acp");
+    drop(std::fs::create_dir_all(&data_dir));
+    let interceptor_path = data_dir.join("pty-interceptor.js");
+
+    if let Err(e) = std::fs::write(&interceptor_path, PTY_INTERCEPTOR_JS) {
+        tracing::warn!(err = %e, ?interceptor_path, "failed to write PTY interceptor script");
+        return None;
+    }
+
+    let sock_path = format!("/tmp/cursor-acp-pty-{}.sock", std::process::id());
+
+    // Clean up stale socket from a previous crash.
+    drop(std::fs::remove_file(&sock_path));
+
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to bind PTY streaming socket");
+            return None;
+        }
+    };
+
+    tracing::info!(sock = %sock_path, "PTY streaming enabled");
+
+    let sock_path_cleanup = sock_path.clone();
+    tokio::spawn(async move {
+        pty_stream_accept_loop(listener, state, to_zed).await;
+        drop(std::fs::remove_file(&sock_path_cleanup));
+    });
+
+    Some(PtyStreamingEnv {
+        sock_path,
+        interceptor_path,
+    })
+}
+
+fn dirs_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        dirs_home().map(|h| h.join(".local/share"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs_home().map(|h| h.join(".local/share")))
+    }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+async fn pty_stream_accept_loop(
+    listener: UnixListener,
+    state: Arc<Mutex<proxy::ProxyState>>,
+    to_zed: mpsc::UnboundedSender<String>,
+) {
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::debug!(err = %e, "PTY stream accept error");
+                break;
+            }
+        };
+
+        let state = Arc::clone(&state);
+        let to_zed = to_zed.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_pty_stream_connection(stream, state, to_zed).await {
+                tracing::debug!(err = %e, "PTY stream connection error");
+            }
+        });
+    }
+}
+
+/// Binary protocol: 4-byte BE length + 1-byte type + payload.
+async fn handle_pty_stream_connection(
+    mut stream: tokio::net::UnixStream,
+    state: Arc<Mutex<proxy::ProxyState>>,
+    to_zed: mpsc::UnboundedSender<String>,
+) -> Result<()> {
+    tracing::debug!("PTY stream connection accepted");
+    loop {
+        let len = match stream.read_u32().await {
+            Ok(l) => l as usize,
+            Err(_) => break,
+        };
+        if len == 0 || len > 1_000_000 {
+            break;
+        }
+
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+
+        let msg_type = buf[0];
+        let payload = &buf[1..];
+
+        match msg_type {
+            // Spawn: 4-byte pid + command string
+            0x01 if payload.len() >= 4 => {
+                let pid = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let cmd = String::from_utf8_lossy(&payload[4..]).to_string();
+                tracing::debug!(pid, cmd = &cmd[..cmd.len().min(200)], "PTY spawn received");
+
+                let mut st = state.lock().await;
+                let matched = proxy::match_pty_spawn(&mut st, pid, &cmd);
+                tracing::debug!(pid, matched = matched.is_some(), "PTY spawn match result");
+            }
+            // Data: 4-byte pid + raw terminal bytes
+            0x02 if payload.len() >= 4 => {
+                let pid = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let data = &payload[4..];
+
+                let notification = {
+                    let mut st = state.lock().await;
+                    if let Some(info) = st.pty_stream_pids.get(&pid).cloned() {
+                        st.pty_streamed_terminals
+                            .insert(info.terminal_id.clone());
+                        let text = String::from_utf8_lossy(data);
+                        Some(proxy::build_streaming_terminal_output(&info, &text))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(n) = notification {
+                    drop(to_zed.send(n));
+                }
+            }
+            // Exit: 4-byte pid
+            0x03 if payload.len() >= 4 => {
+                let pid = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                tracing::debug!(pid, "PTY process exited");
+
+                let mut st = state.lock().await;
+                st.pty_stream_pids.remove(&pid);
+            }
+            _ => {
+                tracing::debug!(msg_type, len = payload.len(), "PTY unknown message type");
+            }
+        }
+    }
+    tracing::debug!("PTY stream connection closed");
+    Ok(())
 }
 
 fn format_history_for_child(history: &[Value]) -> String {
