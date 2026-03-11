@@ -50,16 +50,25 @@ pub async fn run_main() -> Result<()> {
         st.agent_binary = Some(binary.clone());
     }
 
-    // Fetch models in the background so we don't block stdin reading.
-    // Models are only needed when patching session/new and session/load
-    // responses, which happen well after the initialize handshake.
+    // Load cached models immediately so the model list is available for
+    // the first session/new response, then refresh in the background.
+    {
+        let cached = load_cached_models();
+        if !cached.is_empty() {
+            tracing::info!(count = cached.len(), "loaded models from cache");
+            state.lock().await.models = cached;
+        }
+    }
     if binary_available {
         let models_state = Arc::clone(&state);
         let models_binary = binary.clone();
         tokio::spawn(async move {
             let models = fetch_models(&models_binary).await;
-            tracing::info!(count = models.len(), "loaded models");
-            models_state.lock().await.models = models;
+            if !models.is_empty() {
+                tracing::info!(count = models.len(), "refreshed models from agent");
+                save_models_cache(&models);
+                models_state.lock().await.models = models;
+            }
         });
     }
 
@@ -787,6 +796,32 @@ async fn fetch_models(binary: &str) -> Vec<proxy::ModelInfo> {
             tracing::warn!(err = %e, "failed to run --list-models");
             Vec::new()
         }
+    }
+}
+
+fn models_cache_path() -> Option<PathBuf> {
+    dirs_data_dir().map(|d| d.join("cursor-acp").join("models-cache.json"))
+}
+
+fn load_cached_models() -> Vec<proxy::ModelInfo> {
+    let Some(path) = models_cache_path() else {
+        return Vec::new();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_models_cache(models: &[proxy::ModelInfo]) {
+    let Some(path) = models_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        drop(std::fs::create_dir_all(parent));
+    }
+    if let Ok(json) = serde_json::to_string(models) {
+        drop(std::fs::write(&path, json));
     }
 }
 

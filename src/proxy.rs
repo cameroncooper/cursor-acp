@@ -21,7 +21,7 @@ fn perm_log(msg: &str) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
