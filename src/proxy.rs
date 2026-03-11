@@ -1565,6 +1565,13 @@ fn maybe_extract_plan_from_agent_message(
     msg: &Value,
     state: &mut ProxyState,
 ) -> Option<Vec<String>> {
+    // When todos are managed via TodoWrite / _cursor/update_todos, don't let
+    // checklist patterns in streamed assistant text overwrite the authoritative
+    // plan state maintained by handle_update_todos.
+    if !state.todos.is_empty() {
+        return None;
+    }
+
     if msg.get("method").and_then(Value::as_str) != Some("session/update") {
         return None;
     }
@@ -1852,7 +1859,7 @@ fn maybe_emit_plan_markdown_file(
                 "sessionId": session_id,
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": format!("Plan markdown saved to {file_url}\n") }
+                    "content": { "type": "text", "text": format!("Plan markdown saved to {file_url}\n\n") }
                 }
             }
         });
