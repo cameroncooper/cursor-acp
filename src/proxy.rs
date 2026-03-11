@@ -155,6 +155,7 @@ struct PlanInfo {
     name: Option<String>,
 }
 
+#[derive(Debug)]
 pub enum AgentAction {
     Forward,
     Intercept {
@@ -1510,59 +1511,11 @@ fn maybe_extract_plan_from_tool_call(msg: &Value, state: &mut ProxyState) -> Opt
             }
             parsed
         }
-        "updateTodos" => {
-            let todos = update.pointer("/rawInput/todos")?.as_array()?;
-            if todos.is_empty() {
-                return None;
-            }
-            let merge = update
-                .pointer("/rawInput/merge")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if !merge {
-                state.todos.clear();
-            }
-            for item in todos {
-                let id = item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let content = item
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let status = normalize_todo_status(
-                    item.get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("pending"),
-                );
-                if let Some(existing) = state.todos.iter_mut().find(|t| t.id == id) {
-                    existing.content = content;
-                    existing.status = status;
-                } else {
-                    state.todos.push(TodoItem {
-                        id,
-                        content,
-                        status,
-                    });
-                }
-            }
-            // Purge cancelled/placeholder/empty items from state entirely.
-            state.todos.retain(should_show_in_plan);
-            state
-                .todos
-                .iter()
-                .map(|t| {
-                    json!({
-                        "content": t.content,
-                        "priority": "medium",
-                        "status": t.status,
-                    })
-                })
-                .collect()
-        }
+        // updateTodos tool_call updates are handled exclusively by
+        // `handle_update_todos` (which intercepts the `_cursor/update_todos`
+        // request). Processing them here too would clobber state built by that
+        // handler with a partial rawInput snapshot.
+        "updateTodos" => return None,
         _ => return None,
     };
 
@@ -1828,7 +1781,8 @@ fn maybe_emit_plan_markdown_file(
             .session_cwds
             .get(session_id)
             .cloned()
-            .or_else(|| state.pending_sessions.get(session_id).cloned())?;
+            .or_else(|| state.pending_sessions.get(session_id).cloned());
+        let cwd = cwd?;
         if !Path::new(&cwd).is_absolute() {
             return None;
         }
@@ -2702,38 +2656,35 @@ Tip: use --model <id> to switch.
         let mut state = ProxyState::new();
         state.zed_session_id = Some("s1".to_string());
 
+        // Use _cursor/update_todos (the request path) which is the canonical
+        // handler. The tool_call session/update path for updateTodos is
+        // intentionally skipped to avoid clobbering merged state.
         let msg = json!({
             "jsonrpc": "2.0",
-            "method": "session/update",
+            "id": 1,
+            "method": "_cursor/update_todos",
             "params": {
-                "sessionId": "s1",
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "t1",
-                    "title": "Update TODOs",
-                    "rawInput": {
-                        "_toolName": "updateTodos",
-                        "todos": [
-                            { "id": "a", "content": "(empty)", "status": "TODO_STATUS_CANCELLED" },
-                            { "id": "b", "content": "(empty)", "status": "TODO_STATUS_CANCELLED" },
-                            { "id": "c", "content": "Real task", "status": "TODO_STATUS_PENDING" }
-                        ]
-                    }
-                }
+                "todos": [
+                    { "id": "a", "content": "(empty)", "status": "TODO_STATUS_CANCELLED" },
+                    { "id": "b", "content": "(empty)", "status": "TODO_STATUS_CANCELLED" },
+                    { "id": "c", "content": "Real task", "status": "TODO_STATUS_PENDING" }
+                ],
+                "merge": false
             }
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra {
-                extra_notifications,
+            AgentAction::Intercept {
+                notifications_to_zed,
                 ..
             } => {
-                let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                assert_eq!(notifications_to_zed.len(), 1);
+                let notif: Value = serde_json::from_str(&notifications_to_zed[0]).unwrap();
                 let entries = notif["params"]["update"]["entries"].as_array().unwrap();
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0]["content"], "Real task");
             }
-            _ => panic!("expected ForwardWithExtra"),
+            _ => panic!("expected Intercept"),
         }
     }
 
@@ -3367,10 +3318,25 @@ Some description here.
     }
 
     #[test]
-    fn update_todos_tool_call_emits_plan() {
+    fn update_todos_tool_call_skipped_defers_to_request_handler() {
+        // updateTodos tool_call updates (session/update with _toolName
+        // "updateTodos") are intentionally ignored — all todo state is handled
+        // by `handle_update_todos` via the `_cursor/update_todos` request.
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
         state.current_session_id = Some("zed-sess".to_string());
+        state.todos = vec![
+            TodoItem {
+                id: "task-a".to_string(),
+                content: "First task".to_string(),
+                status: "pending".to_string(),
+            },
+            TodoItem {
+                id: "task-b".to_string(),
+                content: "Second task".to_string(),
+                status: "pending".to_string(),
+            },
+        ];
 
         let msg = json!({
             "jsonrpc": "2.0",
@@ -3380,64 +3346,34 @@ Some description here.
                 "update": {
                     "sessionUpdate": "tool_call",
                     "toolCallId": "tool-2",
-                    "title": "Update TODOs: Create jokes.txt",
+                    "title": "Update TODOs",
                     "rawInput": {
                         "_toolName": "updateTodos",
                         "todos": [
-                            {
-                                "id": "create-file",
-                                "content": "Create jokes.txt in the workspace root",
-                                "status": "TODO_STATUS_PENDING",
-                                "createdAt": "1772824517287",
-                                "updatedAt": "1772826101920",
-                                "dependencies": []
-                            },
-                            {
-                                "id": "add-joke",
-                                "content": "Add a joke to jokes.txt",
-                                "status": "TODO_STATUS_IN_PROGRESS",
-                                "createdAt": "1772824517287",
-                                "updatedAt": "1772826101920",
-                                "dependencies": []
-                            },
-                            {
-                                "id": "delete-file",
-                                "content": "Delete jokes.txt",
-                                "status": "TODO_STATUS_COMPLETED",
-                                "createdAt": "1772824517287",
-                                "updatedAt": "1772826101920",
-                                "dependencies": []
-                            }
-                        ]
+                            { "id": "task-a", "content": "First task", "status": "completed" }
+                        ],
+                        "merge": true
                     }
                 }
             }
         });
 
-        match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardWithExtra {
-                extra_notifications,
-                ..
-            } => {
-                assert_eq!(extra_notifications.len(), 1);
-                let notif: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
-                assert_eq!(notif["params"]["sessionId"], "zed-sess");
-                let entries = notif["params"]["update"]["entries"].as_array().unwrap();
-                assert_eq!(entries.len(), 3);
-                assert_eq!(
-                    entries[0]["content"],
-                    "Create jokes.txt in the workspace root"
-                );
-                assert_eq!(entries[0]["status"], "pending");
-                assert_eq!(entries[1]["content"], "Add a joke to jokes.txt");
-                assert_eq!(entries[1]["status"], "in_progress");
-                assert_eq!(entries[2]["content"], "Delete jokes.txt");
-                assert_eq!(entries[2]["status"], "completed");
-            }
-            _ => panic!("expected ForwardWithExtra"),
-        }
-        // Internal state should be updated too
-        assert_eq!(state.todos.len(), 3);
+        assert!(
+            matches!(
+                process_agent_message(&msg, &mut state),
+                AgentAction::Forward
+            ),
+            "updateTodos tool_call should pass through as Forward"
+        );
+        assert_eq!(
+            state.todos.len(),
+            2,
+            "tool_call path must NOT mutate state.todos"
+        );
+        assert_eq!(
+            state.todos[0].status, "pending",
+            "task-a must remain pending (not modified by tool_call path)"
+        );
     }
 
     #[test]
