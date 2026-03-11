@@ -840,7 +840,11 @@ fn maybe_synthesize_terminal_for_execute(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let tc_id = update.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string();
+            let tc_id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             state.pty_pending_matches.push(PtyStreamMatch {
                 terminal_id: terminal_id.clone(),
                 tool_call_id: tc_id,
@@ -939,9 +943,10 @@ fn maybe_synthesize_terminal_for_execute(
 /// Try to match a PTY spawn notification (from the pty-proxy addon) to a
 /// pending execute tool call.  Returns the match if found.
 pub fn match_pty_spawn(state: &mut ProxyState, pid: i32, cmd: &str) -> Option<PtyStreamMatch> {
-    let pos = state.pty_pending_matches.iter().position(|m| {
-        cmd.contains(&m.command) || m.command.contains(cmd)
-    });
+    let pos = state
+        .pty_pending_matches
+        .iter()
+        .position(|m| cmd.contains(&m.command) || m.command.contains(cmd));
     if let Some(idx) = pos {
         let matched = state.pty_pending_matches.remove(idx);
         state.pty_stream_pids.insert(pid, matched.clone());

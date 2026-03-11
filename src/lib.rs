@@ -998,11 +998,8 @@ async fn handle_pty_stream_connection(
     to_zed: mpsc::UnboundedSender<String>,
 ) -> Result<()> {
     tracing::debug!("PTY stream connection accepted");
-    loop {
-        let len = match stream.read_u32().await {
-            Ok(l) => l as usize,
-            Err(_) => break,
-        };
+    while let Ok(l) = stream.read_u32().await {
+        let len = l as usize;
         if len == 0 || len > 1_000_000 {
             break;
         }
@@ -1032,8 +1029,7 @@ async fn handle_pty_stream_connection(
                 let notification = {
                     let mut st = state.lock().await;
                     if let Some(info) = st.pty_stream_pids.get(&pid).cloned() {
-                        st.pty_streamed_terminals
-                            .insert(info.terminal_id.clone());
+                        st.pty_streamed_terminals.insert(info.terminal_id.clone());
                         let text = String::from_utf8_lossy(data);
                         Some(proxy::build_streaming_terminal_output(&info, &text))
                     } else {
