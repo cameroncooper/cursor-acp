@@ -82,6 +82,16 @@ pub struct ProxyState {
     /// `session/new` request. Used to scope `session/list` to this workspace
     /// when the client doesn't provide a `cwd` filter.
     pub workspace_cwd: Option<String>,
+
+    // --- Terminal synthesis for execute tool calls ---
+    /// Maps tool_call_id → generated terminal UUID for execute tool calls
+    /// that we've already patched with terminal_info.
+    terminal_ids: HashMap<String, String>,
+    /// Buffered first `tool_call` messages for execute tool calls that arrived
+    /// without a command yet. Key is tool_call_id, value is the original
+    /// JSON-RPC line. Once the command arrives, we discard the buffer and
+    /// forward only the patched version.
+    buffered_execute_tool_calls: HashMap<String, Value>,
 }
 
 struct TodoItem {
@@ -109,6 +119,8 @@ pub enum AgentAction {
         line: String,
         extra_notifications: Vec<String>,
     },
+    /// Drop the message entirely (e.g., buffered execute tool call awaiting command).
+    Drop,
 }
 
 pub enum ClientAction {
@@ -164,6 +176,8 @@ impl ProxyState {
             session_first_prompt: HashMap::new(),
             plan_file_message_emitted: HashSet::new(),
             workspace_cwd: None,
+            terminal_ids: HashMap::new(),
+            buffered_execute_tool_calls: HashMap::new(),
         }
     }
 
@@ -269,13 +283,14 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
             ClientAction::ForwardPatched(line)
         }
         Some("session/new") => {
-            if let (Some(id), Some(cwd)) = (
-                msg.get("id").map(|v| v.to_string()),
-                msg.pointer("/params/cwd").and_then(Value::as_str),
-            ) {
+            let cwd = msg
+                .pointer("/params/cwd")
+                .and_then(|v| v.as_str().map(String::from));
+
+            if let (Some(id), Some(cwd)) = (msg.get("id").map(|v| v.to_string()), cwd) {
                 state.pending_new_session_cwds.insert(id, cwd.to_string());
                 if state.workspace_cwd.is_none() {
-                    state.workspace_cwd = Some(cwd.to_string());
+                    state.workspace_cwd = Some(cwd);
                 }
             }
             ClientAction::Forward
@@ -480,6 +495,25 @@ pub fn process_agent_message(msg: &Value, state: &mut ProxyState) -> AgentAction
         };
     }
 
+    // Synthesize display-only terminals for execute tool calls so Zed renders
+    // the rich terminal UI (command, output, exit code) instead of a bare card.
+    if let Some(action) = maybe_synthesize_terminal_for_execute(msg, state) {
+        return action;
+    }
+
+    // Inject terminal content into session/request_permission so Zed renders
+    // the terminal UI even for commands that need user approval.
+    if let Some(action) = maybe_inject_terminal_into_request_permission(msg, state) {
+        return action;
+    }
+
+    // Strip backtick wrapping from titles of tracked execute tool calls.
+    // Cursor sends titles like `command` but Zed's terminal UI renders
+    // them as markdown, so backticks cause unwanted inline-code styling.
+    if let Some(action) = maybe_strip_execute_title_backticks(msg, state) {
+        return action;
+    }
+
     // Synthesize fs/ requests for edit tool calls so Zed's ActionLog tracks
     // the changed files (enabling the "Edits" panel with accept/reject).
     if let Some(extra) = maybe_synthesize_fs_for_edit(msg, state) {
@@ -665,6 +699,257 @@ fn remap_session_id(msg: &Value, state: &ProxyState) -> Option<Value> {
     patched["params"]["sessionId"] = json!(zed_sid);
     tracing::debug!(child_sid, zed_sid, "remapped session ID");
     Some(patched)
+}
+
+// ---------------------------------------------------------------------------
+// Terminal synthesis for execute tool calls
+// ---------------------------------------------------------------------------
+
+/// Generate a unique terminal ID (simple hex counter, no uuid dependency).
+fn generate_terminal_id(state: &mut ProxyState) -> String {
+    state.internal_id_counter -= 1;
+    format!("synth-term-{:x}", state.internal_id_counter.unsigned_abs())
+}
+
+/// Intercept execute tool calls to synthesize display-only terminals in Zed.
+///
+/// - On `tool_call` with `kind: "execute"` but no command yet: buffer the
+///   message (return Drop) so Zed doesn't briefly show a bare card.
+/// - On `tool_call` with `kind: "execute"` and `rawInput.command`: patch the
+///   message with `_meta.terminal_info` and `content: [terminal]` so Zed
+///   creates a display-only terminal and renders the rich terminal UI.
+/// - On `tool_call_update` with `status: "completed"` and `rawOutput` for a
+///   tracked execute tool call: inject `_meta.terminal_output` and
+///   `_meta.terminal_exit` so Zed feeds the output into the terminal widget.
+fn maybe_synthesize_terminal_for_execute(msg: &Value, state: &mut ProxyState) -> Option<AgentAction> {
+    let update = msg.pointer("/params/update")?;
+    let update_type = update.get("sessionUpdate")?.as_str()?;
+
+    match update_type {
+        "tool_call" => {
+            let kind = update.get("kind").and_then(Value::as_str);
+            if kind != Some("execute") {
+                return None;
+            }
+
+            let tool_call_id = update.get("toolCallId")?.as_str()?.to_string();
+            let command = update
+                .pointer("/rawInput/command")
+                .and_then(Value::as_str);
+
+            if command.is_none() || command == Some("") {
+                // No command yet — buffer this message so Zed doesn't show a
+                // bare "Terminal" card. We'll discard it when the real one arrives.
+                state
+                    .buffered_execute_tool_calls
+                    .insert(tool_call_id, msg.clone());
+                tracing::debug!("buffered execute tool_call (no command yet)");
+                return Some(AgentAction::Drop);
+            }
+
+            let command = command.unwrap();
+
+            // Discard any buffered version now that we have the real one.
+            state.buffered_execute_tool_calls.remove(&tool_call_id);
+
+            // Generate or reuse terminal ID for this tool call.
+            let terminal_id = if let Some(existing) = state.terminal_ids.get(&tool_call_id) {
+                existing.clone()
+            } else {
+                let id = generate_terminal_id(state);
+                state.terminal_ids.insert(tool_call_id, id.clone());
+                id
+            };
+
+            // Extract cwd from rawInput, falling back to workspace_cwd.
+            let raw_cd = update.pointer("/rawInput/cd").and_then(Value::as_str);
+            let raw_cwd = update.pointer("/rawInput/cwd").and_then(Value::as_str);
+            let raw_wd = update.pointer("/rawInput/working_directory").and_then(Value::as_str);
+            let cwd = raw_cd
+                .or(raw_cwd)
+                .or(raw_wd)
+                .map(String::from)
+                .or_else(|| state.workspace_cwd.clone());
+
+            // Build patched message with terminal_info in _meta and terminal
+            // content so Zed creates a display-only terminal.
+            let mut patched = msg.clone();
+            let patch_update = patched.pointer_mut("/params/update")?;
+
+            // Set _meta.terminal_info
+            let meta = patch_update
+                .as_object_mut()?
+                .entry("_meta")
+                .or_insert_with(|| json!({}));
+            let meta_obj = meta.as_object_mut()?;
+            let mut terminal_info = json!({ "terminal_id": terminal_id });
+            if let Some(ref cwd) = cwd {
+                terminal_info["cwd"] = json!(cwd);
+            }
+            meta_obj.insert("terminal_info".to_string(), terminal_info);
+
+            // Set content to include the terminal reference.
+            patch_update["content"] = json!([{
+                "type": "terminal",
+                "terminalId": terminal_id,
+            }]);
+
+            // Use the plain command as the title — Zed's Terminal::new wraps
+            // it in a markdown code block, so we must not add backticks here.
+            patch_update["title"] = json!(command);
+
+            tracing::debug!(
+                terminal_id = terminal_id.as_str(),
+                command,
+                "synthesized terminal for execute tool call"
+            );
+
+            Some(AgentAction::ForwardPatched(patched.to_string()))
+        }
+        "tool_call_update" => {
+            let tool_call_id = update.get("toolCallId")?.as_str()?;
+            let terminal_id = state.terminal_ids.get(tool_call_id)?.clone();
+
+            let raw_output = update.get("rawOutput")?;
+            let status = update.get("status").and_then(Value::as_str);
+
+            if !matches!(status, Some("completed") | Some("failed")) {
+                return None;
+            }
+
+            let stdout = raw_output
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let stderr = raw_output
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let exit_code = raw_output.get("exitCode").and_then(Value::as_u64);
+
+            // Combine stdout + stderr for the terminal display.
+            let mut output = String::new();
+            if !stdout.is_empty() {
+                output.push_str(stdout);
+            }
+            if !stderr.is_empty() {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(stderr);
+            }
+
+            let mut patched = msg.clone();
+            let patch_update = patched.pointer_mut("/params/update")?;
+
+            let meta = patch_update
+                .as_object_mut()?
+                .entry("_meta")
+                .or_insert_with(|| json!({}));
+            let meta_obj = meta.as_object_mut()?;
+
+            if !output.is_empty() {
+                meta_obj.insert(
+                    "terminal_output".to_string(),
+                    json!({ "terminal_id": terminal_id, "data": output }),
+                );
+            }
+
+            let mut exit_status = json!({ "terminal_id": terminal_id });
+            if let Some(code) = exit_code {
+                exit_status["exit_code"] = json!(code);
+            }
+            meta_obj.insert("terminal_exit".to_string(), exit_status);
+
+            // Clean up tracking state.
+            state.terminal_ids.remove(tool_call_id);
+
+            tracing::debug!(
+                terminal_id = terminal_id.as_str(),
+                ?exit_code,
+                output_len = output.len(),
+                "injected terminal output/exit for execute tool call"
+            );
+
+            Some(AgentAction::ForwardPatched(patched.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// When cursor-agent sends `session/request_permission` for an execute tool call,
+/// the tool_call update inside it will overwrite our previously-injected Terminal
+/// content. Re-inject it here so Zed still renders the terminal UI.
+fn maybe_inject_terminal_into_request_permission(
+    msg: &Value,
+    state: &ProxyState,
+) -> Option<AgentAction> {
+    let method = msg.get("method").and_then(Value::as_str)?;
+    if method != "session/request_permission" {
+        return None;
+    }
+
+    let tool_call_id = msg
+        .pointer("/params/toolCall/toolCallId")
+        .and_then(Value::as_str)?;
+    let terminal_id = state.terminal_ids.get(tool_call_id)?.clone();
+
+    let mut patched = msg.clone();
+    let tool_call = patched.pointer_mut("/params/toolCall")?;
+    let tool_call_obj = tool_call.as_object_mut()?;
+
+    tool_call_obj.insert(
+        "content".to_string(),
+        json!([{ "type": "terminal", "terminalId": terminal_id }]),
+    );
+
+    // Strip backtick wrapping from the title if present.
+    if let Some(title) = tool_call_obj.get("title").and_then(Value::as_str) {
+        if let Some(stripped) = title.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+            tool_call_obj.insert("title".to_string(), json!(stripped));
+        }
+    }
+
+    let meta = tool_call_obj
+        .entry("_meta")
+        .or_insert_with(|| json!({}));
+    if let Some(meta_obj) = meta.as_object_mut() {
+        meta_obj.insert(
+            "terminal_info".to_string(),
+            json!({ "terminal_id": terminal_id }),
+        );
+    }
+
+    tracing::debug!(
+        %terminal_id,
+        tool_call_id,
+        "injected terminal content into request_permission"
+    );
+
+    Some(AgentAction::ForwardPatched(patched.to_string()))
+}
+
+/// Strip surrounding backticks from the `title` field of session/update
+/// messages for tracked execute tool calls. Cursor sends titles like
+/// `` `echo hello` `` but Zed renders them as markdown, producing unwanted
+/// inline-code formatting. This catches any update (tool_call or
+/// tool_call_update) that our synthesize function didn't already patch.
+fn maybe_strip_execute_title_backticks(msg: &Value, state: &ProxyState) -> Option<AgentAction> {
+    let update = msg.pointer("/params/update")?;
+    let tool_call_id = update.get("toolCallId").and_then(Value::as_str)?;
+
+    if !state.terminal_ids.contains_key(tool_call_id) {
+        return None;
+    }
+
+    let title = update.get("title").and_then(Value::as_str)?;
+    let stripped = title.strip_prefix('`').and_then(|s| s.strip_suffix('`'))?;
+
+    let mut patched = msg.clone();
+    let patch_update = patched.pointer_mut("/params/update")?;
+    patch_update["title"] = json!(stripped);
+
+    Some(AgentAction::ForwardPatched(patched.to_string()))
 }
 
 /// When cursor-agent sends edit tool calls, synthesize `fs/read_text_file`
@@ -3036,7 +3321,7 @@ Some description here.
     }
 
     #[test]
-    fn no_synthesize_for_non_edit_tool_call() {
+    fn no_synthesize_fs_for_execute_tool_call() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
 
@@ -3056,9 +3341,17 @@ Some description here.
             }
         });
 
+        // Execute tool calls are now intercepted by terminal synthesis
+        // (not fs synthesis), so we expect ForwardPatched with terminal_info.
         match process_agent_message(&msg, &mut state) {
-            AgentAction::Forward => {}
-            _ => panic!("expected Forward for non-edit tool call"),
+            AgentAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                assert!(parsed["params"]["update"]["_meta"]["terminal_info"].is_object());
+            }
+            other => panic!(
+                "expected ForwardPatched, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
         assert!(state.suppress_zed_response_ids.is_empty());
     }
@@ -3203,5 +3496,390 @@ Some description here.
             }
             _ => panic!("expected Intercept"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal synthesis for execute tool calls
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_tool_call_without_command_is_buffered() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-1",
+                    "title": "Terminal",
+                    "kind": "execute",
+                    "rawInput": {}
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::Drop => {}
+            other => panic!("expected Drop, got {:?}", std::mem::discriminant(&other)),
+        }
+        assert!(state.buffered_execute_tool_calls.contains_key("tc-1"));
+    }
+
+    #[test]
+    fn execute_tool_call_with_command_gets_terminal_info() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-1",
+                    "title": "`echo hello`",
+                    "kind": "execute",
+                    "rawInput": { "command": "echo hello" }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                let update = &parsed["params"]["update"];
+
+                // Should have _meta.terminal_info
+                let terminal_info = &update["_meta"]["terminal_info"];
+                assert!(terminal_info["terminal_id"].is_string());
+                let terminal_id = terminal_info["terminal_id"].as_str().unwrap();
+
+                // Should have content with terminal reference
+                let content = update["content"].as_array().unwrap();
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0]["type"], "terminal");
+                assert_eq!(content[0]["terminalId"], terminal_id);
+
+                // Title should be the command in a code block
+                assert!(update["title"].as_str().unwrap().contains("echo hello"));
+
+                // Terminal ID should be tracked
+                assert_eq!(
+                    state.terminal_ids.get("tc-1").map(String::as_str),
+                    Some(terminal_id)
+                );
+            }
+            other => panic!(
+                "expected ForwardPatched, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn execute_tool_call_with_cwd_includes_cwd_in_terminal_info() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-2",
+                    "title": "`ls`",
+                    "kind": "execute",
+                    "rawInput": { "command": "ls", "cd": "/tmp/myproject" }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                let terminal_info = &parsed["params"]["update"]["_meta"]["terminal_info"];
+                assert_eq!(terminal_info["cwd"], "/tmp/myproject");
+            }
+            other => panic!(
+                "expected ForwardPatched, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn execute_completed_update_injects_terminal_output_and_exit() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state
+            .terminal_ids
+            .insert("tc-1".to_string(), "term-abc".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-1",
+                    "status": "completed",
+                    "rawOutput": {
+                        "exitCode": 0,
+                        "stdout": "hello world\n",
+                        "stderr": ""
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                let meta = &parsed["params"]["update"]["_meta"];
+
+                // Should have terminal_output with stdout
+                let term_out = &meta["terminal_output"];
+                assert_eq!(term_out["terminal_id"], "term-abc");
+                assert_eq!(term_out["data"], "hello world\n");
+
+                // Should have terminal_exit with exit code
+                let term_exit = &meta["terminal_exit"];
+                assert_eq!(term_exit["terminal_id"], "term-abc");
+                assert_eq!(term_exit["exit_code"], 0);
+
+                // Terminal ID should be cleaned up
+                assert!(!state.terminal_ids.contains_key("tc-1"));
+            }
+            other => panic!(
+                "expected ForwardPatched, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn execute_completed_update_combines_stdout_and_stderr() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state
+            .terminal_ids
+            .insert("tc-1".to_string(), "term-xyz".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-1",
+                    "status": "completed",
+                    "rawOutput": {
+                        "exitCode": 1,
+                        "stdout": "partial output",
+                        "stderr": "error: something failed"
+                    }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                let data = parsed["params"]["update"]["_meta"]["terminal_output"]["data"]
+                    .as_str()
+                    .unwrap();
+                assert!(data.contains("partial output"));
+                assert!(data.contains("error: something failed"));
+
+                let exit_code =
+                    parsed["params"]["update"]["_meta"]["terminal_exit"]["exit_code"].as_u64();
+                assert_eq!(exit_code, Some(1));
+            }
+            other => panic!(
+                "expected ForwardPatched, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn execute_in_progress_update_not_intercepted_without_raw_output() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+        state
+            .terminal_ids
+            .insert("tc-1".to_string(), "term-abc".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-1",
+                    "status": "in_progress"
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::Forward => {}
+            other => panic!(
+                "expected Forward, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        // Terminal ID should still be tracked
+        assert!(state.terminal_ids.contains_key("tc-1"));
+    }
+
+    #[test]
+    fn non_execute_tool_call_not_intercepted() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-read",
+                    "title": "Read file",
+                    "kind": "read",
+                    "rawInput": { "path": "/tmp/foo.txt" }
+                }
+            }
+        });
+
+        match process_agent_message(&msg, &mut state) {
+            AgentAction::Forward => {}
+            other => panic!(
+                "expected Forward, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        assert!(state.terminal_ids.is_empty());
+    }
+
+    #[test]
+    fn execute_full_lifecycle() {
+        let mut state = ProxyState::new();
+        state.zed_session_id = Some("zed-sess".to_string());
+
+        // Step 1: tool_call with no command → buffered
+        let msg1 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-lifecycle",
+                    "title": "Terminal",
+                    "kind": "execute",
+                    "rawInput": {}
+                }
+            }
+        });
+        assert!(matches!(
+            process_agent_message(&msg1, &mut state),
+            AgentAction::Drop
+        ));
+
+        // Step 2: tool_call with command → patched with terminal_info
+        let msg2 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-lifecycle",
+                    "title": "`echo hello`",
+                    "kind": "execute",
+                    "rawInput": { "command": "echo hello" }
+                }
+            }
+        });
+        let terminal_id = match process_agent_message(&msg2, &mut state) {
+            AgentAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                parsed["params"]["update"]["_meta"]["terminal_info"]["terminal_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+            other => panic!(
+                "expected ForwardPatched, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        assert!(!state.buffered_execute_tool_calls.contains_key("tc-lifecycle"));
+
+        // Step 3: tool_call_update in_progress → forwarded as-is
+        let msg3 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-lifecycle",
+                    "status": "in_progress"
+                }
+            }
+        });
+        assert!(matches!(
+            process_agent_message(&msg3, &mut state),
+            AgentAction::Forward
+        ));
+
+        // Step 4: tool_call_update completed → patched with terminal_output/exit
+        let msg4 = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "zed-sess",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-lifecycle",
+                    "status": "completed",
+                    "rawOutput": {
+                        "exitCode": 0,
+                        "stdout": "hello\n",
+                        "stderr": ""
+                    }
+                }
+            }
+        });
+        match process_agent_message(&msg4, &mut state) {
+            AgentAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                let meta = &parsed["params"]["update"]["_meta"];
+                assert_eq!(meta["terminal_output"]["terminal_id"], terminal_id);
+                assert_eq!(meta["terminal_output"]["data"], "hello\n");
+                assert_eq!(meta["terminal_exit"]["terminal_id"], terminal_id);
+                assert_eq!(meta["terminal_exit"]["exit_code"], 0);
+            }
+            other => panic!(
+                "expected ForwardPatched, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // Terminal ID should be cleaned up after completion
+        assert!(!state.terminal_ids.contains_key("tc-lifecycle"));
     }
 }
