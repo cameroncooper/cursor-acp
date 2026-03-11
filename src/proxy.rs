@@ -1912,9 +1912,10 @@ fn default_plan_file_path(cwd: &str, plan_name: Option<&str>) -> String {
     let file_name = plan_name
         .map(sanitize_filename_component)
         .filter(|s| !s.is_empty())
-        .map(|name| format!(".cursor-acp-plan-{name}.md"))
-        .unwrap_or_else(|| ".cursor-acp-plan.md".to_string());
+        .map(|name| format!("{name}.md"))
+        .unwrap_or_else(|| "plan.md".to_string());
     PathBuf::from(cwd)
+        .join(".plans")
         .join(file_name)
         .to_string_lossy()
         .into_owned()
