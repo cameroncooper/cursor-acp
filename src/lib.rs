@@ -186,6 +186,9 @@ pub async fn run_main() -> Result<()> {
                     let mut st = stdin_state.lock().await;
                     st.zed_session_id = Some(session_id.to_string());
                     st.session_cwds.insert(session_id.to_string(), cwd.clone());
+                    if st.workspace_cwd.is_none() {
+                        st.workspace_cwd = Some(cwd.clone());
+                    }
                     st.set_pending_history_injection(session_id, history_for_child);
                     let req_id = st.next_internal_id();
                     st.suppress_response(req_id.clone());
@@ -822,6 +825,18 @@ async fn read_child_stdout(
                     drop(to_zed.send(notification));
                 }
             }
+            proxy::AgentAction::SpawnStreaming {
+                line: forwarded,
+                command: _,
+                cwd: _,
+                terminal_id: _,
+                tool_call_id: _,
+                session_id: _,
+            } => {
+                drop(to_zed.send(forwarded));
+                // TODO: spawn local subprocess and stream terminal output to Zed
+            }
+            proxy::AgentAction::Drop => {}
         }
     }
     tracing::debug!("child stdout EOF");
@@ -862,40 +877,146 @@ async fn write_stdout(mut rx: mpsc::UnboundedReceiver<String>) {
 }
 
 fn format_history_for_child(history: &[Value]) -> String {
+    use std::collections::HashMap;
+
+    struct ToolInfo {
+        title: String,
+        kind: String,
+    }
+
     let mut out = String::new();
+    let mut tool_info: HashMap<String, ToolInfo> = HashMap::new();
+
+    #[derive(PartialEq)]
+    enum Speaker {
+        None,
+        User,
+        Assistant,
+        Tool,
+    }
+    let mut last_speaker = Speaker::None;
+
     for update in history {
-        let kind = update.get("sessionUpdate").and_then(Value::as_str);
-        match kind {
-            Some("user_message_chunk") => {
+        let update_type = match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        match update_type {
+            "user_message_chunk" => {
                 if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
-                    out.push_str("User: ");
+                    if last_speaker == Speaker::Assistant || last_speaker == Speaker::Tool {
+                        out.push_str("\n---\n\n");
+                    }
+                    if last_speaker != Speaker::User {
+                        out.push_str("User: ");
+                    }
                     out.push_str(text);
                     out.push('\n');
+                    last_speaker = Speaker::User;
                 }
             }
-            Some("agent_message_chunk") | Some("assistant_message_chunk") => {
+            "agent_message_chunk" | "assistant_message_chunk" => {
                 if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
-                    out.push_str("Assistant: ");
+                    if last_speaker != Speaker::Assistant {
+                        out.push_str("Assistant: ");
+                    }
                     out.push_str(text);
                     out.push('\n');
+                    last_speaker = Speaker::Assistant;
                 }
+            }
+            "tool_call" => {
+                if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
+                    let title = update
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let kind = update
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("other")
+                        .to_string();
+                    tool_info.insert(id.to_string(), ToolInfo { title, kind });
+                }
+            }
+            "tool_call_update" => {
+                let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+                if status != "completed" && status != "error" {
+                    continue;
+                }
+                let id = match update.get("toolCallId").and_then(Value::as_str) {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let info = tool_info.remove(id);
+                let title = info.as_ref().map(|i| i.title.as_str()).unwrap_or("?");
+                let kind = info.as_ref().map(|i| i.kind.as_str()).unwrap_or("other");
+
+                let mut summary = format!("[Tool: {title} ({kind}) → {status}");
+
+                if let Some(raw) = update.get("rawOutput") {
+                    match kind {
+                        "execute" => {
+                            if let Some(code) = raw.get("exitCode").and_then(Value::as_i64) {
+                                summary.push_str(&format!(", exit {code}"));
+                            }
+                            if let Some(stdout) = raw.get("stdout").and_then(Value::as_str) {
+                                let trimmed = stdout.trim();
+                                if !trimmed.is_empty() {
+                                    let snippet = truncate_str(trimmed, 300);
+                                    summary.push_str(&format!("\n  stdout: {snippet}"));
+                                }
+                            }
+                        }
+                        "read" => {
+                            if let Some(content) = raw.get("content").and_then(Value::as_str) {
+                                let snippet = truncate_str(content.trim(), 200);
+                                summary.push_str(&format!("\n  content: {snippet}"));
+                            }
+                        }
+                        "search" => {
+                            if let Some(n) = raw.get("totalMatches").and_then(Value::as_u64) {
+                                summary.push_str(&format!(", {n} matches"));
+                            } else if let Some(n) = raw.get("totalFiles").and_then(Value::as_u64) {
+                                summary.push_str(&format!(", {n} files"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                summary.push(']');
+                out.push_str(&summary);
+                out.push('\n');
+                last_speaker = Speaker::Tool;
             }
             _ => {}
         }
     }
 
-    // Keep the injected context bounded to avoid excessive prompt growth.
-    const MAX_CHARS: usize = 12_000;
+    const MAX_CHARS: usize = 50_000;
     if out.len() <= MAX_CHARS {
         return out.trim().to_string();
     }
-    out.chars()
-        .rev()
-        .take(MAX_CHARS)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-        .trim()
-        .to_string()
+    // Keep the tail (most recent context is most valuable).
+    let boundary = out.len() - MAX_CHARS;
+    let start = out[boundary..]
+        .find('\n')
+        .map(|i| boundary + i + 1)
+        .unwrap_or(boundary);
+    format!(
+        "[...earlier history truncated...]\n\n{}",
+        out[start..].trim()
+    )
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let end = s.floor_char_boundary(max.min(s.len()));
+        format!("{}…", &s[..end])
+    }
 }
