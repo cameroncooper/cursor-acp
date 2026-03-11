@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
@@ -923,26 +924,41 @@ fn setup_pty_streaming(
         return None;
     }
 
+    #[cfg(unix)]
     let sock_path = format!("/tmp/cursor-acp-pty-{}.sock", std::process::id());
+    #[cfg(windows)]
+    let sock_path = format!(r"\\.\pipe\cursor-acp-pty-{}", std::process::id());
 
-    // Clean up stale socket from a previous crash.
-    drop(std::fs::remove_file(&sock_path));
+    #[cfg(unix)]
+    {
+        drop(std::fs::remove_file(&sock_path));
 
-    let listener = match UnixListener::bind(&sock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to bind PTY streaming socket");
-            return None;
-        }
-    };
+        let listener = match UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to bind PTY streaming socket");
+                return None;
+            }
+        };
 
-    tracing::info!(sock = %sock_path, "PTY streaming enabled");
+        tracing::info!(sock = %sock_path, "PTY streaming enabled");
 
-    let sock_path_cleanup = sock_path.clone();
-    tokio::spawn(async move {
-        pty_stream_accept_loop(listener, state, to_zed).await;
-        drop(std::fs::remove_file(&sock_path_cleanup));
-    });
+        let sock_path_cleanup = sock_path.clone();
+        tokio::spawn(async move {
+            pty_stream_accept_loop(listener, state, to_zed).await;
+            drop(std::fs::remove_file(&sock_path_cleanup));
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        tracing::info!(pipe = %sock_path, "PTY streaming enabled (named pipe)");
+
+        let pipe_name = sock_path.clone();
+        tokio::spawn(async move {
+            pty_stream_accept_loop(pipe_name, state, to_zed).await;
+        });
+    }
 
     Some(PtyStreamingEnv {
         sock_path,
@@ -955,7 +971,13 @@ fn dirs_data_dir() -> Option<PathBuf> {
     {
         dirs_home().map(|h| h.join(".local/share"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .map(PathBuf::from)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -964,9 +986,12 @@ fn dirs_data_dir() -> Option<PathBuf> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
+#[cfg(unix)]
 async fn pty_stream_accept_loop(
     listener: UnixListener,
     state: Arc<Mutex<proxy::ProxyState>>,
@@ -991,9 +1016,60 @@ async fn pty_stream_accept_loop(
     }
 }
 
+#[cfg(windows)]
+async fn pty_stream_accept_loop(
+    pipe_name: String,
+    state: Arc<Mutex<proxy::ProxyState>>,
+    to_zed: mpsc::UnboundedSender<String>,
+) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let mut server = match ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to create PTY named pipe");
+            return;
+        }
+    };
+
+    loop {
+        if let Err(e) = server.connect().await {
+            tracing::debug!(err = %e, "PTY named pipe connect error");
+            break;
+        }
+
+        let connected = server;
+        server = match ServerOptions::new().create(&pipe_name) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(err = %e, "PTY named pipe create error");
+                let state = Arc::clone(&state);
+                let to_zed = to_zed.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_pty_stream_connection(connected, state, to_zed).await {
+                        tracing::debug!(err = %e, "PTY stream connection error");
+                    }
+                });
+                break;
+            }
+        };
+
+        let state = Arc::clone(&state);
+        let to_zed = to_zed.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_pty_stream_connection(connected, state, to_zed).await {
+                tracing::debug!(err = %e, "PTY stream connection error");
+            }
+        });
+    }
+}
+
 /// Binary protocol: 4-byte BE length + 1-byte type + payload.
 async fn handle_pty_stream_connection(
-    mut stream: tokio::net::UnixStream,
+    mut stream: impl tokio::io::AsyncRead + Unpin,
     state: Arc<Mutex<proxy::ProxyState>>,
     to_zed: mpsc::UnboundedSender<String>,
 ) -> Result<()> {

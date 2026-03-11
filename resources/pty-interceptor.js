@@ -9,7 +9,7 @@
   function log() {
     if (!DEBUG) return;
     if (!_logFd) {
-      try { _logFd = require('fs').openSync('/tmp/pty-interceptor.log', 'a'); } catch(_) { return; }
+      try { _logFd = require('fs').openSync(require('path').join(require('os').tmpdir(), 'pty-interceptor.log'), 'a'); } catch(_) { return; }
     }
     var args = Array.prototype.slice.call(arguments);
     require('fs').writeSync(_logFd, '[pty-interceptor pid=' + process.pid + '] ' + args.join(' ') + '\n');
@@ -84,6 +84,9 @@
         cmdStr = args[dashIdx + 1];
       } else {
         var cIdx = args.indexOf('-c');
+        if (cIdx < 0) cIdx = args.indexOf('/c');
+        if (cIdx < 0) cIdx = args.indexOf('/C');
+        if (cIdx < 0) cIdx = args.indexOf('-Command');
         if (cIdx >= 0 && cIdx + 1 < args.length) {
           cmdStr = args[cIdx + 1];
         } else {
