@@ -825,6 +825,17 @@ async fn read_child_stdout(
                     drop(to_zed.send(notification));
                 }
             }
+            proxy::AgentAction::SpawnStreaming {
+                line: forwarded,
+                command: _,
+                cwd: _,
+                terminal_id: _,
+                tool_call_id: _,
+                session_id: _,
+            } => {
+                drop(to_zed.send(forwarded));
+                // TODO: spawn local subprocess and stream terminal output to Zed
+            }
             proxy::AgentAction::Drop => {}
         }
     }
@@ -968,9 +979,7 @@ fn format_history_for_child(history: &[Value]) -> String {
                         "search" => {
                             if let Some(n) = raw.get("totalMatches").and_then(Value::as_u64) {
                                 summary.push_str(&format!(", {n} matches"));
-                            } else if let Some(n) =
-                                raw.get("totalFiles").and_then(Value::as_u64)
-                            {
+                            } else if let Some(n) = raw.get("totalFiles").and_then(Value::as_u64) {
                                 summary.push_str(&format!(", {n} files"));
                             }
                         }
@@ -997,7 +1006,10 @@ fn format_history_for_child(history: &[Value]) -> String {
         .find('\n')
         .map(|i| boundary + i + 1)
         .unwrap_or(boundary);
-    format!("[...earlier history truncated...]\n\n{}", out[start..].trim())
+    format!(
+        "[...earlier history truncated...]\n\n{}",
+        out[start..].trim()
+    )
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

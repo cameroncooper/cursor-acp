@@ -119,6 +119,17 @@ pub enum AgentAction {
         line: String,
         extra_notifications: Vec<String>,
     },
+    /// Forward the patched line AND spawn a local subprocess to stream terminal
+    /// output to Zed in real-time (instead of waiting for cursor-agent's batch).
+    #[allow(dead_code)]
+    SpawnStreaming {
+        line: String,
+        command: String,
+        cwd: Option<String>,
+        terminal_id: String,
+        tool_call_id: String,
+        session_id: String,
+    },
     /// Drop the message entirely (e.g., buffered execute tool call awaiting command).
     Drop,
 }
@@ -721,7 +732,10 @@ fn generate_terminal_id(state: &mut ProxyState) -> String {
 /// - On `tool_call_update` with `status: "completed"` and `rawOutput` for a
 ///   tracked execute tool call: inject `_meta.terminal_output` and
 ///   `_meta.terminal_exit` so Zed feeds the output into the terminal widget.
-fn maybe_synthesize_terminal_for_execute(msg: &Value, state: &mut ProxyState) -> Option<AgentAction> {
+fn maybe_synthesize_terminal_for_execute(
+    msg: &Value,
+    state: &mut ProxyState,
+) -> Option<AgentAction> {
     let update = msg.pointer("/params/update")?;
     let update_type = update.get("sessionUpdate")?.as_str()?;
 
@@ -733,9 +747,7 @@ fn maybe_synthesize_terminal_for_execute(msg: &Value, state: &mut ProxyState) ->
             }
 
             let tool_call_id = update.get("toolCallId")?.as_str()?.to_string();
-            let command = update
-                .pointer("/rawInput/command")
-                .and_then(Value::as_str);
+            let command = update.pointer("/rawInput/command").and_then(Value::as_str);
 
             if command.is_none() || command == Some("") {
                 // No command yet — buffer this message so Zed doesn't show a
@@ -764,7 +776,9 @@ fn maybe_synthesize_terminal_for_execute(msg: &Value, state: &mut ProxyState) ->
             // Extract cwd from rawInput, falling back to workspace_cwd.
             let raw_cd = update.pointer("/rawInput/cd").and_then(Value::as_str);
             let raw_cwd = update.pointer("/rawInput/cwd").and_then(Value::as_str);
-            let raw_wd = update.pointer("/rawInput/working_directory").and_then(Value::as_str);
+            let raw_wd = update
+                .pointer("/rawInput/working_directory")
+                .and_then(Value::as_str);
             let cwd = raw_cd
                 .or(raw_cwd)
                 .or(raw_wd)
@@ -904,15 +918,13 @@ fn maybe_inject_terminal_into_request_permission(
     );
 
     // Strip backtick wrapping from the title if present.
-    if let Some(title) = tool_call_obj.get("title").and_then(Value::as_str) {
-        if let Some(stripped) = title.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
-            tool_call_obj.insert("title".to_string(), json!(stripped));
-        }
+    if let Some(title) = tool_call_obj.get("title").and_then(Value::as_str)
+        && let Some(stripped) = title.strip_prefix('`').and_then(|s| s.strip_suffix('`'))
+    {
+        tool_call_obj.insert("title".to_string(), json!(stripped));
     }
 
-    let meta = tool_call_obj
-        .entry("_meta")
-        .or_insert_with(|| json!({}));
+    let meta = tool_call_obj.entry("_meta").or_insert_with(|| json!({}));
     if let Some(meta_obj) = meta.as_object_mut() {
         meta_obj.insert(
             "terminal_info".to_string(),
@@ -3734,10 +3746,7 @@ Some description here.
 
         match process_agent_message(&msg, &mut state) {
             AgentAction::Forward => {}
-            other => panic!(
-                "expected Forward, got {:?}",
-                std::mem::discriminant(&other)
-            ),
+            other => panic!("expected Forward, got {:?}", std::mem::discriminant(&other)),
         }
         // Terminal ID should still be tracked
         assert!(state.terminal_ids.contains_key("tc-1"));
@@ -3765,10 +3774,7 @@ Some description here.
 
         match process_agent_message(&msg, &mut state) {
             AgentAction::Forward => {}
-            other => panic!(
-                "expected Forward, got {:?}",
-                std::mem::discriminant(&other)
-            ),
+            other => panic!("expected Forward, got {:?}", std::mem::discriminant(&other)),
         }
         assert!(state.terminal_ids.is_empty());
     }
@@ -3826,7 +3832,11 @@ Some description here.
                 std::mem::discriminant(&other)
             ),
         };
-        assert!(!state.buffered_execute_tool_calls.contains_key("tc-lifecycle"));
+        assert!(
+            !state
+                .buffered_execute_tool_calls
+                .contains_key("tc-lifecycle")
+        );
 
         // Step 3: tool_call_update in_progress → forwarded as-is
         let msg3 = json!({
