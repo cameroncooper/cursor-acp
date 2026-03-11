@@ -76,7 +76,8 @@ jobs:
           TAG="${{ steps.get_version.outputs.tag_name }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml distribution/
+          cargo update --workspace
+          git add Cargo.toml Cargo.lock distribution/
           git commit -m "chore(release): ${TAG} [skip ci]"
           git tag "$TAG"
           git push origin HEAD
