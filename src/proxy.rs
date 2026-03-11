@@ -17,7 +17,7 @@ fn perm_log(msg: &str) {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let _ = writeln!(f, "[{ts}] {msg}");
+        drop(writeln!(f, "[{ts}] {msg}"));
     }
 }
 
@@ -326,19 +326,13 @@ fn parse_env_flag(raw: Option<&str>, default: bool) -> bool {
 pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientAction {
     // Broad logging: capture every Zed message for debugging permissions.
     if let Some(method) = msg.get("method").and_then(Value::as_str) {
-        let id = msg
-            .get("id")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
         perm_log(&format!(
             "ZED MSG method={method} id={id} has_params={}",
             msg.get("params").is_some()
         ));
     } else if msg.get("result").is_some() || msg.get("error").is_some() {
-        let id = msg
-            .get("id")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
         let has_option = msg.pointer("/result/outcome/optionId").is_some();
         perm_log(&format!(
             "ZED MSG response id={id} has_result={} has_error={} has_optionId={has_option}",
@@ -524,19 +518,13 @@ fn handle_set_model(msg: &Value, state: &mut ProxyState) -> ClientAction {
 pub fn process_agent_message(msg: &Value, state: &mut ProxyState) -> AgentAction {
     // Broad logging: capture every agent message method for debugging permissions.
     if let Some(method) = msg.get("method").and_then(Value::as_str) {
-        let id = msg
-            .get("id")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
         perm_log(&format!(
             "AGENT MSG method={method} id={id} has_params={}",
             msg.get("params").is_some()
         ));
     } else if msg.get("result").is_some() || msg.get("error").is_some() {
-        let id = msg
-            .get("id")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+        let id = msg.get("id").map(|v| v.to_string()).unwrap_or_default();
         perm_log(&format!(
             "AGENT MSG response id={id} has_result={} has_error={}",
             msg.get("result").is_some(),
@@ -1094,7 +1082,7 @@ fn maybe_auto_approve_permission(msg: &Value, state: &ProxyState) -> Option<Agen
     ));
 
     if !state.allowed_tool_kinds.contains(tool_kind) {
-        perm_log(&format!("  -> NOT cached, forwarding to Zed"));
+        perm_log("  -> NOT cached, forwarding to Zed");
         return None;
     }
 
@@ -1111,7 +1099,9 @@ fn maybe_auto_approve_permission(msg: &Value, state: &ProxyState) -> Option<Agen
         }
     })?;
 
-    perm_log(&format!("  -> AUTO-APPROVE kind={tool_kind:?} option_id={option_id:?}"));
+    perm_log(&format!(
+        "  -> AUTO-APPROVE kind={tool_kind:?} option_id={option_id:?}"
+    ));
     tracing::info!(
         tool_kind,
         option_id = option_id.as_str(),
@@ -1208,7 +1198,10 @@ pub fn maybe_cache_permission_response(msg: &Value, state: &mut ProxyState) {
     if let (Some(selected), Some(always_id)) = (selected_option_id, &pending.allow_always_option_id)
         && selected == always_id
     {
-        perm_log(&format!("  -> CACHING allow-always for kind={:?}", pending.tool_kind));
+        perm_log(&format!(
+            "  -> CACHING allow-always for kind={:?}",
+            pending.tool_kind
+        ));
         tracing::info!(
             tool_kind = pending.tool_kind.as_str(),
             "caching allow-always for tool kind"
