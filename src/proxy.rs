@@ -662,6 +662,18 @@ fn inject_session_list_capability_and_cursor_login_meta(
         obj.insert("sessionCapabilities".to_string(), json!({ "list": {} }));
     }
 
+    // Zed can embed mention contents (including terminal selections) directly into prompts,
+    // but only does so when the server advertises embeddedContext support. Without this,
+    // terminal quoting degrades into a non-actionable `zed:///agent/terminal-selection?...`
+    // resource link.
+    if patched
+        .pointer("/result/agentCapabilities/promptCapabilities")
+        .is_none()
+    {
+        patched["result"]["agentCapabilities"]["promptCapabilities"] = json!({});
+    }
+    patched["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"] = json!(true);
+
     // Cursor's ACP server advertises an auth method (`cursor_login`) but may still require
     // the user to run `cursor-agent login` in a terminal. Zed supports an experimental
     // `terminal-auth` metadata field on auth methods to spawn a login command.
