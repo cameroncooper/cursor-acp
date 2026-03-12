@@ -1003,9 +1003,7 @@ fn maybe_synthesize_terminal_for_execute(
                 }
 
                 if !output.is_empty() {
-                    state
-                        .replay_output_present
-                        .insert(tool_call_id.clone());
+                    state.replay_output_present.insert(tool_call_id.clone());
 
                     let output_notification = json!({
                         "jsonrpc": "2.0",
@@ -1060,9 +1058,7 @@ fn maybe_synthesize_terminal_for_execute(
             // If we already streamed this terminal's output in real-time,
             // or pre-sent it during replay, skip batch output to avoid duplicates.
             let already_streamed = state.pty_streamed_terminals.remove(&terminal_id);
-            let replay_pre_sent = state
-                .replay_output_present
-                .remove(tool_call_id);
+            let replay_pre_sent = state.replay_output_present.remove(tool_call_id);
 
             let mut output = String::new();
             if !already_streamed && !replay_pre_sent {
