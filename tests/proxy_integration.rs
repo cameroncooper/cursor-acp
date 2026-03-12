@@ -156,16 +156,38 @@ fn proxy_forwards_normal_messages_and_intercepts_todos() {
 
     let messages = run_proxy_with_fake_agent(&script, &input);
 
-    let has_response: Vec<bool> = messages.iter().map(|m| m.get("result").is_some()).collect();
+    // Find responses by content; order may vary on CI (e.g. aarch64 Linux).
+    let init_responses: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m.get("id").and_then(Value::as_i64) == Some(1) && m.get("result").is_some())
+        .collect();
+    assert_eq!(init_responses.len(), 1, "initialize response");
+    assert!(
+        init_responses[0]["result"].get("protocolVersion").is_some(),
+        "initialize has protocolVersion"
+    );
 
-    // 1. Initialize response forwarded
-    assert!(has_response[0], "initialize response");
+    let auth_responses: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m.get("id").and_then(Value::as_i64) == Some(2) && m.get("result").is_some())
+        .collect();
+    assert_eq!(auth_responses.len(), 1, "authenticate response");
 
-    // 2. Authenticate response forwarded
-    assert!(has_response[1], "authenticate response");
-
-    // 3. session/new response forwarded
-    let session_result = &messages[2]["result"];
+    let session_new_responses: Vec<&Value> = messages
+        .iter()
+        .filter(|m| {
+            m.get("result")
+                .and_then(|r| r.get("sessionId"))
+                .and_then(Value::as_str)
+                == Some("test-sess-1")
+        })
+        .collect();
+    assert_eq!(
+        session_new_responses.len(),
+        1,
+        "exactly one session/new response with sessionId test-sess-1"
+    );
+    let session_result = &session_new_responses[0]["result"];
     assert_eq!(session_result["sessionId"], "test-sess-1");
 
     // Find the Plan notification (synthesized from _cursor/update_todos)
