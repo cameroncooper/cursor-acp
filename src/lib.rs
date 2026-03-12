@@ -74,6 +74,30 @@ pub async fn run_main() -> Result<()> {
 
     let store = Arc::new(sessions::SessionStore::new().await);
 
+    // Serialize history writes to preserve update order during replay.
+    //
+    // History consists of many high-frequency `*_message_chunk` updates. If we
+    // write them from independent spawned tasks, scheduling can reorder writes,
+    // which produces garbled markdown when we later replay via `session/load`.
+    let (history_tx, mut history_rx) = mpsc::unbounded_channel::<proxy::SessionUpdateInfo>();
+    {
+        let history_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            while let Some(info) = history_rx.recv().await {
+                history_store
+                    .append_history(&info.session_id, &info.update)
+                    .await;
+                if let Some(t) = info.title.as_deref() {
+                    history_store.update_title(&info.session_id, t).await;
+                } else if let Some(text) = info.user_message.as_deref() {
+                    history_store
+                        .set_title_if_empty(&info.session_id, text)
+                        .await;
+                }
+            }
+        });
+    }
+
     // Periodic flush task: persist session index every 30s if dirty.
     let flush_store = Arc::clone(&store);
     tokio::spawn(async move {
@@ -92,7 +116,7 @@ pub async fn run_main() -> Result<()> {
     // Spawn initial child if possible. If not, we still start and let Zed prompt
     // the user to install Cursor CLI.
     let initial_child = if binary_available {
-        match spawn_child(&binary, None, &pty_env) {
+        match spawn_child(&binary, None, &pty_env, None) {
             Ok(child) => Some(child),
             Err(e) => {
                 tracing::warn!(err = %e, "failed to spawn initial agent; will run without child");
@@ -112,13 +136,15 @@ pub async fn run_main() -> Result<()> {
     let stdin_to_zed = to_zed_tx.clone();
     let stdin_child_handle = Arc::clone(&child_handle);
     let stdin_store = Arc::clone(&store);
+    let stdin_history_tx = history_tx.clone();
     let binary_for_restart = binary.clone();
     let pty_env_for_restart = pty_env.clone();
     let stdin_task = tokio::spawn(async move {
         let reader = BufReader::new(tokio::io::stdin());
         let mut lines = reader.lines();
-        // When model changes, we need a new channel for the new child writer.
+        // When model changes or cwd changes, we need a new channel for the new child writer.
         let mut current_to_child = to_child_tx;
+        let mut child_cwd: Option<String> = None;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let msg: Option<Value> = serde_json::from_str(&line).ok();
@@ -178,25 +204,13 @@ pub async fn run_main() -> Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or("");
 
-                // Replay stored history as session/update notifications.
-                let history = stdin_store.load_history(session_id).await;
-                tracing::info!(
-                    count = history.len(),
-                    session_id,
-                    "replaying session history"
-                );
-                for update in &history {
-                    let notification = sessions::build_history_notification(session_id, update);
-                    drop(stdin_to_zed.send(notification));
-                }
-
-                // Set the Zed session ID and create a fresh session in the child
-                // so subsequent prompts have a valid context.
-                let cwd = msg
+                // Determine cwd early so replay-time synthesis (e.g. terminal cards)
+                // can show a stable cwd rather than whatever the current process cwd is.
+                let explicit_cwd = msg
                     .pointer("/params/cwd")
                     .and_then(Value::as_str)
                     .map(String::from);
-                let stored_cwd = if cwd.is_none() {
+                let stored_cwd = if explicit_cwd.is_none() {
                     stdin_store
                         .list_sessions(None)
                         .await
@@ -206,19 +220,183 @@ pub async fn run_main() -> Result<()> {
                 } else {
                     None
                 };
-                let cwd = cwd.or(stored_cwd).unwrap_or_else(|| ".".to_string());
+                let cwd = explicit_cwd
+                    .or(stored_cwd)
+                    .unwrap_or_else(|| ".".to_string());
 
-                // Also stash a condensed history blob so the next `session/prompt`
-                // includes context for the child agent after a restart.
-                let history_for_child = format_history_for_child(&history);
-
-                let (load_req_id, child_session_ready_rx) = {
+                // Set the Zed session ID and cwd before replay so replayed updates can be
+                // patched consistently (e.g., terminal synthesis needs per-session state).
+                {
                     let mut st = stdin_state.lock().await;
                     st.zed_session_id = Some(session_id.to_string());
                     st.session_cwds.insert(session_id.to_string(), cwd.clone());
-                    if st.workspace_cwd.is_none() {
-                        st.workspace_cwd = Some(cwd.clone());
+                    st.workspace_cwd = Some(cwd.clone());
+                }
+
+                // Replay stored history as session/update notifications.
+                let history_raw = stdin_store.load_history(session_id).await;
+                let history = coalesce_history_text_chunks(&history_raw);
+                tracing::info!(
+                    count = history.len(),
+                    session_id,
+                    "replaying session history"
+                );
+                // Pre-scan history for execute tool_call_updates with rawOutput
+                // so we can send terminal output before terminal creation during
+                // replay (fixing the display-only terminal timing issue).
+                {
+                    let mut replay_outputs = std::collections::HashMap::new();
+                    for h in &history {
+                        if h.get("sessionUpdate").and_then(Value::as_str)
+                            == Some("tool_call_update")
+                            && let (Some(tc_id), Some(raw)) = (
+                                h.get("toolCallId").and_then(Value::as_str),
+                                h.get("rawOutput"),
+                            )
+                        {
+                            let status = h.get("status").and_then(Value::as_str);
+                            if matches!(status, Some("completed") | Some("failed")) {
+                                replay_outputs.insert(tc_id.to_string(), raw.clone());
+                            }
+                        }
                     }
+                    if !replay_outputs.is_empty() {
+                        tracing::debug!(
+                            count = replay_outputs.len(),
+                            "pre-fetched terminal outputs for replay"
+                        );
+                        let mut st = stdin_state.lock().await;
+                        st.set_replay_execute_outputs(replay_outputs);
+                    }
+                }
+
+                {
+                    let mut st = stdin_state.lock().await;
+                    st.is_replaying = true;
+                }
+                for update in &history {
+                    // Re-run agent-side patching during replay so Zed can reconstruct
+                    // rich UI elements (e.g., display-only terminals with output).
+                    let notif = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": update,
+                        }
+                    });
+                    let action = {
+                        let mut st = stdin_state.lock().await;
+                        proxy::process_agent_message(&notif, &mut st)
+                    };
+                    match action {
+                        proxy::AgentAction::Forward => {
+                            drop(stdin_to_zed.send(notif.to_string()));
+                        }
+                        proxy::AgentAction::ForwardPatched(patched) => {
+                            drop(stdin_to_zed.send(patched));
+                        }
+                        proxy::AgentAction::ForwardWithExtra {
+                            line,
+                            extra_notifications,
+                        } => {
+                            drop(stdin_to_zed.send(line));
+                            for n in extra_notifications {
+                                drop(stdin_to_zed.send(n));
+                            }
+                        }
+                        proxy::AgentAction::Intercept {
+                            response_to_child: _,
+                            notifications_to_zed,
+                        } => {
+                            for n in notifications_to_zed {
+                                drop(stdin_to_zed.send(n));
+                            }
+                        }
+                        proxy::AgentAction::SpawnStreaming { line, .. } => {
+                            drop(stdin_to_zed.send(line));
+                        }
+                        proxy::AgentAction::Drop => {}
+                    }
+                }
+
+                {
+                    let mut st = stdin_state.lock().await;
+                    st.is_replaying = false;
+                    st.set_replay_execute_outputs(std::collections::HashMap::new());
+                }
+
+                // Set the Zed session ID and create a fresh session in the child
+                // so subsequent prompts have a valid context.
+                // Also stash a condensed history blob so the next `session/prompt`
+                // includes context for the child agent after a restart.
+                let mut history_for_child = format_history_for_child(&history);
+                if let Some(todos_md) = extract_latest_todos_markdown(&history) {
+                    if !history_for_child.trim().is_empty() {
+                        history_for_child.push_str("\n---\n\n");
+                    }
+                    history_for_child.push_str("Current TODOs:\n\n");
+                    history_for_child.push_str(&todos_md);
+                    history_for_child.push('\n');
+                }
+
+                // Restart child with the session's cwd so its process working
+                // directory matches the workspace (used for Workspace Path, etc.).
+                if child_cwd.as_deref() != Some(&cwd) && std::path::Path::new(&cwd).is_absolute() {
+                    tracing::info!(cwd = %cwd, "restarting child with workspace cwd for loaded session");
+                    {
+                        let mut handle = stdin_child_handle.lock().await;
+                        if let Some(child) = handle.as_mut() {
+                            drop(child.stdin.take());
+                            child.kill().await.ok();
+                        }
+                    }
+                    match spawn_child(&binary_for_restart, None, &pty_env_for_restart, Some(&cwd)) {
+                        Ok(new_child) => {
+                            *stdin_child_handle.lock().await = Some(new_child);
+                            child_cwd = Some(cwd.clone());
+
+                            let (new_tx, new_rx) = mpsc::unbounded_channel::<String>();
+                            current_to_child = new_tx.clone();
+
+                            let new_stdin = stdin_child_handle
+                                .lock()
+                                .await
+                                .as_mut()
+                                .and_then(|c| c.stdin.take())
+                                .unwrap();
+                            tokio::spawn(write_to_sink(new_stdin, new_rx));
+
+                            let new_stdout = stdin_child_handle
+                                .lock()
+                                .await
+                                .as_mut()
+                                .and_then(|c| c.stdout.take())
+                                .unwrap();
+                            tokio::spawn(read_child_stdout(
+                                new_stdout,
+                                stdin_to_zed.clone(),
+                                new_tx,
+                                Arc::clone(&stdin_state),
+                                stdin_history_tx.clone(),
+                            ));
+
+                            let replay_msgs = {
+                                let mut st = stdin_state.lock().await;
+                                st.prepare_replay_messages()
+                            };
+                            for msg in replay_msgs {
+                                drop(current_to_child.send(msg));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(err = %e, "failed to restart child for cwd (session/load)");
+                        }
+                    }
+                }
+
+                let (load_req_id, child_session_ready_rx) = {
+                    let mut st = stdin_state.lock().await;
                     st.set_pending_history_injection(session_id, history_for_child);
                     let req_id = st.next_internal_id();
                     st.suppress_response(req_id.clone());
@@ -314,6 +492,70 @@ pub async fn run_main() -> Result<()> {
 
             match action {
                 proxy::ClientAction::Forward => {
+                    // On session/new, restart the child with .current_dir(cwd)
+                    // if its process cwd doesn't match the requested workspace.
+                    if let Some(ref msg) = msg
+                        && msg.get("method").and_then(Value::as_str) == Some("session/new")
+                        && let Some(new_cwd) = msg.pointer("/params/cwd").and_then(Value::as_str)
+                        && child_cwd.as_deref() != Some(new_cwd)
+                        && std::path::Path::new(new_cwd).is_absolute()
+                    {
+                        tracing::info!(cwd = %new_cwd, "restarting child with workspace cwd");
+                        {
+                            let mut handle = stdin_child_handle.lock().await;
+                            if let Some(child) = handle.as_mut() {
+                                drop(child.stdin.take());
+                                child.kill().await.ok();
+                            }
+                        }
+                        match spawn_child(
+                            &binary_for_restart,
+                            None,
+                            &pty_env_for_restart,
+                            Some(new_cwd),
+                        ) {
+                            Ok(new_child) => {
+                                *stdin_child_handle.lock().await = Some(new_child);
+                                child_cwd = Some(new_cwd.to_string());
+
+                                let (new_tx, new_rx) = mpsc::unbounded_channel::<String>();
+                                current_to_child = new_tx.clone();
+
+                                let new_stdin = stdin_child_handle
+                                    .lock()
+                                    .await
+                                    .as_mut()
+                                    .and_then(|c| c.stdin.take())
+                                    .unwrap();
+                                tokio::spawn(write_to_sink(new_stdin, new_rx));
+
+                                let new_stdout = stdin_child_handle
+                                    .lock()
+                                    .await
+                                    .as_mut()
+                                    .and_then(|c| c.stdout.take())
+                                    .unwrap();
+                                tokio::spawn(read_child_stdout(
+                                    new_stdout,
+                                    stdin_to_zed.clone(),
+                                    new_tx,
+                                    Arc::clone(&stdin_state),
+                                    stdin_history_tx.clone(),
+                                ));
+
+                                let replay_msgs = {
+                                    let mut st = stdin_state.lock().await;
+                                    st.prepare_replay_messages()
+                                };
+                                for msg in replay_msgs {
+                                    drop(current_to_child.send(msg));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(err = %e, "failed to restart child for cwd");
+                            }
+                        }
+                    }
                     drop(current_to_child.send(line));
                 }
                 proxy::ClientAction::ForwardPatched(patched) => {
@@ -332,17 +574,24 @@ pub async fn run_main() -> Result<()> {
                         (pending, sid)
                     };
                     if let Some(sid) = zed_sid {
+                        // Persist prompt in ordered history so reloads replay cleanly.
+                        let user_update = serde_json::json!({
+                            "sessionUpdate": "user_message_chunk",
+                            "content": { "type": "text", "text": prompt_text.clone() }
+                        });
+                        drop(stdin_history_tx.send(proxy::SessionUpdateInfo {
+                            session_id: sid.clone(),
+                            update: user_update,
+                            title: None,
+                            user_message: Some(prompt_text.clone()),
+                        }));
+
                         let s = Arc::clone(&stdin_store);
                         tokio::spawn(async move {
                             if let Some((id, cwd)) = pending {
                                 tracing::debug!(session_id = %id, cwd = %cwd, "creating session on first prompt");
                                 s.create_session(&id, &cwd).await;
                             }
-                            let user_update = serde_json::json!({
-                                "sessionUpdate": "user_message_chunk",
-                                "content": { "type": "text", "text": prompt_text }
-                            });
-                            s.append_history(&sid, &user_update).await;
                             s.set_title_if_empty(&sid, &prompt_text).await;
                         });
                     }
@@ -369,7 +618,12 @@ pub async fn run_main() -> Result<()> {
                         }
 
                         // Spawn new child.
-                        match spawn_child(&binary_for_restart, Some(&model), &pty_env_for_restart) {
+                        match spawn_child(
+                            &binary_for_restart,
+                            Some(&model),
+                            &pty_env_for_restart,
+                            child_cwd.as_deref(),
+                        ) {
                             Ok(new_child) => {
                                 *stdin_child_handle.lock().await = Some(new_child);
 
@@ -396,13 +650,12 @@ pub async fn run_main() -> Result<()> {
                                 let reader_to_zed = stdin_to_zed.clone();
                                 let reader_to_child = new_tx;
                                 let reader_state = Arc::clone(&stdin_state);
-                                let reader_store = Arc::clone(&stdin_store);
                                 tokio::spawn(read_child_stdout(
                                     new_stdout,
                                     reader_to_zed,
                                     reader_to_child,
                                     reader_state,
-                                    reader_store,
+                                    stdin_history_tx.clone(),
                                 ));
 
                                 // Replay init + auth with unique IDs (responses suppressed).
@@ -487,7 +740,7 @@ pub async fn run_main() -> Result<()> {
             to_zed_tx,
             to_child_for_intercept,
             Arc::clone(&state),
-            Arc::clone(&store),
+            history_tx.clone(),
         ));
     } else {
         // Drop receiver so any sends fail fast (we guard on child existence anyway).
@@ -727,6 +980,7 @@ fn spawn_child(
     binary: &str,
     model: Option<&str>,
     pty_env: &Option<PtyStreamingEnv>,
+    cwd: Option<&str>,
 ) -> Result<Child> {
     let mut cmd = build_command(binary);
     cmd.arg("acp")
@@ -736,6 +990,10 @@ fn spawn_child(
 
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
+    }
+
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
     }
 
     if let Some(env) = pty_env {
@@ -830,7 +1088,7 @@ async fn read_child_stdout(
     to_zed: mpsc::UnboundedSender<String>,
     to_child: mpsc::UnboundedSender<String>,
     state: Arc<Mutex<proxy::ProxyState>>,
-    store: Arc<sessions::SessionStore>,
+    history_tx: mpsc::UnboundedSender<proxy::SessionUpdateInfo>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -859,15 +1117,7 @@ async fn read_child_stdout(
                     info.session_id = zed_sid.clone();
                 }
             }
-            let s = Arc::clone(&store);
-            tokio::spawn(async move {
-                s.append_history(&info.session_id, &info.update).await;
-                if let Some(t) = info.title {
-                    s.update_title(&info.session_id, &t).await;
-                } else if let Some(text) = info.user_message {
-                    s.set_title_if_empty(&info.session_id, &text).await;
-                }
-            });
+            drop(history_tx.send(info));
         }
 
         let action = {
@@ -899,6 +1149,22 @@ async fn read_child_stdout(
                     drop(to_child.send(resp));
                 }
                 for notification in notifications_to_zed {
+                    // Persist synthesized plan updates (e.g. from _cursor/update_todos)
+                    // so session/load can restore the todo list.
+                    if let Ok(v) = serde_json::from_str::<Value>(&notification)
+                        && v.get("method").and_then(Value::as_str) == Some("session/update")
+                        && v.pointer("/params/update/sessionUpdate")
+                            .and_then(Value::as_str)
+                            == Some("plan")
+                        && let Some(mut info) = proxy::extract_session_update(&v)
+                    {
+                        // Normalize to Zed's session ID for grouping.
+                        let st = state.lock().await;
+                        if let Some(zed_sid) = &st.zed_session_id {
+                            info.session_id = zed_sid.clone();
+                        }
+                        drop(history_tx.send(info));
+                    }
                     drop(to_zed.send(notification));
                 }
             }
@@ -917,6 +1183,52 @@ async fn read_child_stdout(
         }
     }
     tracing::debug!("child stdout EOF");
+}
+
+fn extract_latest_todos_markdown(history: &[Value]) -> Option<String> {
+    // Walk from the end to find the last todo-driven plan update.
+    for update in history.iter().rev() {
+        if update.get("sessionUpdate").and_then(Value::as_str) != Some("plan") {
+            continue;
+        }
+        let meta = update.pointer("/_meta/cursor-acp")?;
+        let source = meta.get("sourceTool").and_then(Value::as_str);
+        let name = meta.get("planName").and_then(Value::as_str);
+        if source != Some("_cursor/update_todos") && name != Some("Todos") {
+            continue;
+        }
+        if let Some(md) = meta.get("derivedTodosMarkdown").and_then(Value::as_str) {
+            let trimmed = md.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        // Fallback: rebuild markdown from entries.
+        let entries = update.get("entries").and_then(Value::as_array)?;
+        let mut out = String::new();
+        for e in entries {
+            let content = e
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if content.is_empty() {
+                continue;
+            }
+            let status = e.get("status").and_then(Value::as_str).unwrap_or("pending");
+            match status {
+                "completed" => out.push_str(&format!("- [x] {content}\n")),
+                "in_progress" => out.push_str(&format!("- [ ] (in progress) {content}\n")),
+                _ => out.push_str(&format!("- [ ] {content}\n")),
+            }
+        }
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 async fn write_to_sink(
@@ -1320,11 +1632,97 @@ fn format_history_for_child(history: &[Value]) -> String {
     )
 }
 
+/// Coalesce consecutive `*_message_chunk` updates (text only) into larger chunks.
+///
+/// Zed's history replay path may not preserve leading whitespace across many tiny
+/// chunks. Coalescing makes replay more robust and improves performance.
+fn coalesce_history_text_chunks(history: &[Value]) -> Vec<Value> {
+    fn text_chunk_type(update: &Value) -> Option<&str> {
+        let t = update.get("sessionUpdate")?.as_str()?;
+        match t {
+            "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" => Some(t),
+            _ => None,
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(history.len());
+    let mut cur_type: Option<String> = None;
+    let mut cur_update: Option<Value> = None;
+    let mut cur_text = String::new();
+
+    let flush = |out: &mut Vec<Value>,
+                 cur_type: &mut Option<String>,
+                 cur_update: &mut Option<Value>,
+                 cur_text: &mut String| {
+        if let Some(mut u) = cur_update.take() {
+            if let Some(obj) = u.pointer_mut("/content").and_then(|v| v.as_object_mut()) {
+                obj.insert("text".to_string(), Value::String(cur_text.clone()));
+            }
+            out.push(u);
+        }
+        *cur_type = None;
+        cur_text.clear();
+    };
+
+    for update in history {
+        let Some(t) = text_chunk_type(update) else {
+            flush(&mut out, &mut cur_type, &mut cur_update, &mut cur_text);
+            out.push(update.clone());
+            continue;
+        };
+
+        let is_text = update.pointer("/content/type").and_then(Value::as_str) == Some("text");
+        let Some(text) = update.pointer("/content/text").and_then(Value::as_str) else {
+            flush(&mut out, &mut cur_type, &mut cur_update, &mut cur_text);
+            out.push(update.clone());
+            continue;
+        };
+        if !is_text {
+            flush(&mut out, &mut cur_type, &mut cur_update, &mut cur_text);
+            out.push(update.clone());
+            continue;
+        }
+
+        match (&cur_type, &cur_update) {
+            (Some(ct), Some(_)) if ct == t => {
+                cur_text.push_str(text);
+            }
+            _ => {
+                flush(&mut out, &mut cur_type, &mut cur_update, &mut cur_text);
+                cur_type = Some(t.to_string());
+                cur_update = Some(update.clone());
+                cur_text.push_str(text);
+            }
+        }
+    }
+    flush(&mut out, &mut cur_type, &mut cur_update, &mut cur_text);
+    out
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
         let end = s.floor_char_boundary(max.min(s.len()));
         format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod todos_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_latest_todos_markdown_prefers_update_todos_plan() {
+        let history = vec![
+            json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}),
+            json!({"sessionUpdate":"plan","entries":[{"content":"Other plan","status":"pending"}],"_meta":{"cursor-acp":{"sourceTool":"createPlan","derivedTodosMarkdown":"- [ ] Other plan\n","planName":"Other"}}}),
+            json!({"sessionUpdate":"plan","entries":[{"content":"Task A","status":"pending"},{"content":"Task B","status":"completed"}],"_meta":{"cursor-acp":{"sourceTool":"_cursor/update_todos","derivedTodosMarkdown":"- [ ] Task A\n- [x] Task B\n","planName":"Todos"}}}),
+        ];
+        let md = extract_latest_todos_markdown(&history).unwrap();
+        assert!(md.contains("Task A"));
+        assert!(md.contains("Task B"));
+        assert!(!md.contains("Other plan"));
     }
 }

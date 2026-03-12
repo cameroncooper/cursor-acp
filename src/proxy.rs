@@ -127,6 +127,21 @@ pub struct ProxyState {
     /// requests to (tool_kind, allow_always_option_id) so we can recognize
     /// allow-always responses when they come back from Zed.
     pending_permission_requests: HashMap<String, PendingPermission>,
+
+    /// True while replaying saved history during `session/load`.
+    /// Suppresses agent-message plan detection so only explicit
+    /// `_cursor/update_todos` entries produce plan items.
+    pub is_replaying: bool,
+
+    /// During replay: pre-fetched rawOutput for execute tool calls so we can
+    /// send terminal output BEFORE terminal creation. This ensures Zed buffers
+    /// the output in `pending_terminal_output`, which is drained synchronously
+    /// when the terminal is created — guaranteeing the output is captured before
+    /// the display-only terminal's `_output_task` polls.
+    replay_execute_outputs: HashMap<String, Value>,
+    /// Tool call IDs for which output was pre-sent during replay (so we skip
+    /// sending it again when the tool_call_update arrives).
+    replay_output_present: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +259,9 @@ impl ProxyState {
             pty_streamed_terminals: HashSet::new(),
             allowed_tool_kinds: HashSet::new(),
             pending_permission_requests: HashMap::new(),
+            is_replaying: false,
+            replay_execute_outputs: HashMap::new(),
+            replay_output_present: HashSet::new(),
         }
     }
 
@@ -264,6 +282,13 @@ impl ProxyState {
         let (tx, rx) = oneshot::channel();
         self.pending_session_new_waiters.insert(id.to_string(), tx);
         rx
+    }
+
+    /// Pre-populate rawOutput data for execute tool calls so the replay loop
+    /// can send terminal output before terminal creation.
+    pub fn set_replay_execute_outputs(&mut self, outputs: HashMap<String, Value>) {
+        self.replay_execute_outputs = outputs;
+        self.replay_output_present.clear();
     }
 
     /// Stash a formatted history blob to inject into the next prompt for `session_id`.
@@ -881,7 +906,7 @@ fn maybe_synthesize_terminal_for_execute(
                 existing.clone()
             } else {
                 let id = generate_terminal_id(state);
-                state.terminal_ids.insert(tool_call_id, id.clone());
+                state.terminal_ids.insert(tool_call_id.clone(), id.clone());
                 id
             };
 
@@ -939,7 +964,7 @@ fn maybe_synthesize_terminal_for_execute(
             state.pty_pending_matches.push(PtyStreamMatch {
                 terminal_id: terminal_id.clone(),
                 tool_call_id: tc_id,
-                session_id,
+                session_id: session_id.clone(),
                 command: command.to_string(),
             });
 
@@ -948,6 +973,66 @@ fn maybe_synthesize_terminal_for_execute(
                 command,
                 "synthesized terminal for execute tool call"
             );
+
+            // During replay, if we have pre-fetched output for this tool call,
+            // send it BEFORE the terminal creation so Zed buffers it in
+            // `pending_terminal_output`. When the terminal is created, the
+            // buffer is drained synchronously — ensuring the output is in the
+            // Alacritty grid before `_output_task` captures it.
+            if state.is_replaying
+                && let Some(raw_output) = state.replay_execute_outputs.remove(&tool_call_id)
+            {
+                let stdout = raw_output
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let stderr = raw_output
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+
+                let mut output = String::new();
+                if !stdout.is_empty() {
+                    output.push_str(stdout);
+                }
+                if !stderr.is_empty() {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(stderr);
+                }
+
+                if !output.is_empty() {
+                    state
+                        .replay_output_present
+                        .insert(tool_call_id.clone());
+
+                    let output_notification = json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "tool_call_update",
+                                "toolCallId": tool_call_id,
+                                "status": "in_progress",
+                                "_meta": {
+                                    "terminal_output": {
+                                        "terminal_id": terminal_id,
+                                        "data": output,
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .to_string();
+
+                    return Some(AgentAction::ForwardWithExtra {
+                        line: output_notification,
+                        extra_notifications: vec![patched.to_string()],
+                    });
+                }
+            }
 
             Some(AgentAction::ForwardPatched(patched.to_string()))
         }
@@ -973,11 +1058,14 @@ fn maybe_synthesize_terminal_for_execute(
             let exit_code = raw_output.get("exitCode").and_then(Value::as_u64);
 
             // If we already streamed this terminal's output in real-time,
-            // skip the batch output to avoid duplicates.
+            // or pre-sent it during replay, skip batch output to avoid duplicates.
             let already_streamed = state.pty_streamed_terminals.remove(&terminal_id);
+            let replay_pre_sent = state
+                .replay_output_present
+                .remove(tool_call_id);
 
             let mut output = String::new();
-            if !already_streamed {
+            if !already_streamed && !replay_pre_sent {
                 if !stdout.is_empty() {
                     output.push_str(stdout);
                 }
@@ -998,13 +1086,6 @@ fn maybe_synthesize_terminal_for_execute(
                 .or_insert_with(|| json!({}));
             let meta_obj = meta.as_object_mut()?;
 
-            if !output.is_empty() {
-                meta_obj.insert(
-                    "terminal_output".to_string(),
-                    json!({ "terminal_id": terminal_id, "data": output }),
-                );
-            }
-
             let mut exit_status = json!({ "terminal_id": terminal_id });
             if let Some(code) = exit_code {
                 exit_status["exit_code"] = json!(code);
@@ -1021,7 +1102,41 @@ fn maybe_synthesize_terminal_for_execute(
                 "injected terminal output/exit for execute tool call"
             );
 
-            Some(AgentAction::ForwardPatched(patched.to_string()))
+            if !output.is_empty() {
+                // Zed's terminal widget expects output as streaming-style updates.
+                // Emit an in_progress update with terminal_output, then the completed
+                // update with terminal_exit.
+                let session_id = msg
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let output_notification = json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": tool_call_id,
+                            "status": "in_progress",
+                            "_meta": {
+                                "terminal_output": {
+                                    "terminal_id": terminal_id,
+                                    "data": output,
+                                }
+                            }
+                        }
+                    }
+                })
+                .to_string();
+
+                Some(AgentAction::ForwardWithExtra {
+                    line: output_notification,
+                    extra_notifications: vec![patched.to_string()],
+                })
+            } else {
+                Some(AgentAction::ForwardPatched(patched.to_string()))
+            }
         }
         _ => None,
     }
@@ -1577,6 +1692,13 @@ fn maybe_extract_plan_from_agent_message(
     msg: &Value,
     state: &mut ProxyState,
 ) -> Option<Vec<String>> {
+    // During replay we must not re-detect plans from streamed text — the
+    // authoritative todo state is restored from persisted _cursor/update_todos
+    // entries (handled by maybe_extract_plan_from_tool_call).
+    if state.is_replaying {
+        return None;
+    }
+
     // When todos are managed via TodoWrite / _cursor/update_todos, don't let
     // checklist patterns in streamed assistant text overwrite the authoritative
     // plan state maintained by handle_update_todos.
@@ -1720,13 +1842,28 @@ fn attach_plan_markdown_meta(
         }
     });
 
+    // Only attach full plan markdown when the agent provided an authoritative
+    // plan blob (CreatePlan). For `_cursor/update_todos`, the derived markdown
+    // from the todo list is the source of truth; attaching a previously-detected
+    // plan markdown here can cause confusing/stale plan files.
     if let Some(plan) = state.plans.get(session_id) {
-        if !plan.markdown.trim().is_empty() {
+        if source_tool == "createPlan" && !plan.markdown.trim().is_empty() {
             meta["cursor-acp"]["planMarkdown"] = json!(plan.markdown.as_str());
         }
-        if let Some(name) = &plan.name {
+        // Still attach a planName for agent-message-derived plans so Zed's plan UI
+        // can label the plan, but avoid doing so for `_cursor/update_todos` where
+        // the todo list is authoritative and naming should fall back to the session.
+        if matches!(source_tool, "createPlan" | "agent_message_chunk")
+            && let Some(name) = &plan.name
+        {
             meta["cursor-acp"]["planName"] = json!(name);
         }
+    }
+
+    // For updateTodos, use a stable filename/label rather than the session's first
+    // prompt (which is often not related to the todo list and can be misleading).
+    if source_tool == "_cursor/update_todos" && meta.pointer("/cursor-acp/planName").is_none() {
+        meta["cursor-acp"]["planName"] = json!("Todos");
     }
 
     if meta.pointer("/cursor-acp/planName").is_none()
@@ -3736,7 +3873,7 @@ Some description here.
     }
 
     #[test]
-    fn update_todos_plan_file_uses_prompt_fallback_name() {
+    fn update_todos_plan_file_uses_stable_todos_name() {
         let mut state = ProxyState::new();
         state.zed_session_id = Some("zed-sess".to_string());
         state.current_session_id = Some("zed-sess".to_string());
@@ -3777,8 +3914,8 @@ Some description here.
                     .unwrap()
                     .to_string();
                 assert!(
-                    path.contains("fix-the-doubling-bug"),
-                    "expected prompt text in filename, got: {path}"
+                    path.ends_with("/.plans/Todos.md") || path.ends_with("\\.plans\\Todos.md"),
+                    "expected stable Todos.md filename, got: {path}"
                 );
             }
             _ => panic!("expected Intercept"),
@@ -3928,17 +4065,22 @@ Some description here.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardPatched(patched) => {
-                let parsed: Value = serde_json::from_str(&patched).unwrap();
-                let meta = &parsed["params"]["update"]["_meta"];
-
-                // Should have terminal_output with stdout
-                let term_out = &meta["terminal_output"];
+            AgentAction::ForwardWithExtra {
+                line,
+                extra_notifications,
+            } => {
+                // Output arrives as a streaming-style in_progress update.
+                let out_msg: Value = serde_json::from_str(&line).unwrap();
+                let out_meta = &out_msg["params"]["update"]["_meta"];
+                let term_out = &out_meta["terminal_output"];
                 assert_eq!(term_out["terminal_id"], "term-abc");
                 assert_eq!(term_out["data"], "hello world\n");
 
-                // Should have terminal_exit with exit code
-                let term_exit = &meta["terminal_exit"];
+                // Completion update carries terminal_exit.
+                assert_eq!(extra_notifications.len(), 1);
+                let done_msg: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                let done_meta = &done_msg["params"]["update"]["_meta"];
+                let term_exit = &done_meta["terminal_exit"];
                 assert_eq!(term_exit["terminal_id"], "term-abc");
                 assert_eq!(term_exit["exit_code"], 0);
 
@@ -3979,16 +4121,21 @@ Some description here.
         });
 
         match process_agent_message(&msg, &mut state) {
-            AgentAction::ForwardPatched(patched) => {
-                let parsed: Value = serde_json::from_str(&patched).unwrap();
-                let data = parsed["params"]["update"]["_meta"]["terminal_output"]["data"]
+            AgentAction::ForwardWithExtra {
+                line,
+                extra_notifications,
+            } => {
+                let out_msg: Value = serde_json::from_str(&line).unwrap();
+                let data = out_msg["params"]["update"]["_meta"]["terminal_output"]["data"]
                     .as_str()
                     .unwrap();
                 assert!(data.contains("partial output"));
                 assert!(data.contains("error: something failed"));
 
+                assert_eq!(extra_notifications.len(), 1);
+                let done_msg: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
                 let exit_code =
-                    parsed["params"]["update"]["_meta"]["terminal_exit"]["exit_code"].as_u64();
+                    done_msg["params"]["update"]["_meta"]["terminal_exit"]["exit_code"].as_u64();
                 assert_eq!(exit_code, Some(1));
             }
             other => panic!(
@@ -4150,13 +4297,20 @@ Some description here.
             }
         });
         match process_agent_message(&msg4, &mut state) {
-            AgentAction::ForwardPatched(patched) => {
-                let parsed: Value = serde_json::from_str(&patched).unwrap();
-                let meta = &parsed["params"]["update"]["_meta"];
-                assert_eq!(meta["terminal_output"]["terminal_id"], terminal_id);
-                assert_eq!(meta["terminal_output"]["data"], "hello\n");
-                assert_eq!(meta["terminal_exit"]["terminal_id"], terminal_id);
-                assert_eq!(meta["terminal_exit"]["exit_code"], 0);
+            AgentAction::ForwardWithExtra {
+                line,
+                extra_notifications,
+            } => {
+                let out_msg: Value = serde_json::from_str(&line).unwrap();
+                let out_meta = &out_msg["params"]["update"]["_meta"];
+                assert_eq!(out_meta["terminal_output"]["terminal_id"], terminal_id);
+                assert_eq!(out_meta["terminal_output"]["data"], "hello\n");
+
+                assert_eq!(extra_notifications.len(), 1);
+                let done_msg: Value = serde_json::from_str(&extra_notifications[0]).unwrap();
+                let done_meta = &done_msg["params"]["update"]["_meta"];
+                assert_eq!(done_meta["terminal_exit"]["terminal_id"], terminal_id);
+                assert_eq!(done_meta["terminal_exit"]["exit_code"], 0);
             }
             other => panic!(
                 "expected ForwardPatched, got {:?}",

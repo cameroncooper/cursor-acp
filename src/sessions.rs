@@ -306,18 +306,6 @@ pub fn build_load_response(
     .to_string()
 }
 
-pub fn build_history_notification(session_id: &str, update: &Value) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "sessionId": session_id,
-            "update": update,
-        }
-    })
-    .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,24 +368,6 @@ mod tests {
         assert_eq!(parsed["id"], 7);
         assert_eq!(parsed["result"]["modes"]["currentModeId"], "agent");
         assert_eq!(parsed["result"]["models"]["currentModelId"], "auto");
-    }
-
-    #[test]
-    fn build_history_notification_format() {
-        let update = json!({
-            "sessionUpdate": "user_message_chunk",
-            "content": { "type": "text", "text": "hello" }
-        });
-
-        let notif = build_history_notification("sess-1", &update);
-        let parsed: Value = serde_json::from_str(&notif).unwrap();
-
-        assert_eq!(parsed["method"], "session/update");
-        assert_eq!(parsed["params"]["sessionId"], "sess-1");
-        assert_eq!(
-            parsed["params"]["update"]["sessionUpdate"],
-            "user_message_chunk"
-        );
     }
 
     #[tokio::test]
