@@ -527,6 +527,20 @@ fn resolve_agent_binary() -> String {
         return bin;
     }
 
+    if let Some(pinned) = resolve_cursor_agent_version("2026.02.27-e7d2ef6") {
+        tracing::info!(
+            path = %pinned,
+            version = "2026.02.27-e7d2ef6",
+            "using pinned cursor-agent version"
+        );
+        return pinned;
+    }
+
+    if let Some(latest) = resolve_latest_cursor_agent_version() {
+        tracing::info!(path = %latest, "using latest installed cursor-agent version");
+        return latest;
+    }
+
     if which_exists("cursor-agent") {
         return "cursor-agent".to_string();
     }
@@ -540,6 +554,69 @@ fn resolve_agent_binary() -> String {
         "cursor-agent not found on PATH; set CURSOR_AGENT_BIN to the full path of cursor-agent"
     );
     "cursor-agent".to_string()
+}
+
+fn resolve_cursor_agent_version(version: &str) -> Option<String> {
+    let versions_dir = cursor_agent_versions_dir()?;
+    let candidate = versions_dir.join(version).join(cursor_agent_binary_name());
+    if candidate.is_file() {
+        return Some(candidate.to_string_lossy().into_owned());
+    }
+    None
+}
+
+fn resolve_latest_cursor_agent_version() -> Option<String> {
+    let versions_dir = cursor_agent_versions_dir()?;
+    let mut candidates: Vec<(String, PathBuf)> = std::fs::read_dir(versions_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let version = path.file_name()?.to_str()?.to_string();
+            let binary = path.join(cursor_agent_binary_name());
+            if !binary.is_file() {
+                return None;
+            }
+            Some((version, binary))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates
+        .first()
+        .map(|(_, path)| path.to_string_lossy().into_owned())
+}
+
+fn cursor_agent_versions_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
+        return Some(PathBuf::from(local_app_data).join("cursor-agent").join("versions"));
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").ok()?;
+        Some(
+            PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("cursor-agent")
+                .join("versions"),
+        )
+    }
+}
+
+fn cursor_agent_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cursor-agent.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "cursor-agent"
+    }
 }
 
 fn binary_available(binary: &str) -> bool {
