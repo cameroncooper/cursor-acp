@@ -109,6 +109,8 @@ Set `RUST_LOG=debug` in the env config for proxy-level logging.
 | `CURSOR_ACP_WRITE_PLAN_FILE` | Emit plan markdown via `fs/write_text_file` (default: enabled; set `0`/`false` to disable) |
 | `CURSOR_ACP_WRITE_PLAN_FILE_MESSAGE` | Emit a chat message with a `file:///` plan link (default: enabled; set `0`/`false` to disable) |
 | `CURSOR_ACP_LINK_CURSOR_PLAN_FILE` | Prefer linking to existing `.cursor/plans` markdown when available (default: disabled) |
+| `CURSOR_ACP_WORKSPACE_ROOT` | Force an absolute workspace root used for all `session/new` forwarding and child restarts |
+| `CURSOR_ACP_ALLOW_ROOT_WORKSPACE` | Allow root (`/` on Unix, drive root on Windows) as workspace (default: disabled) |
 
 ## Architecture
 
