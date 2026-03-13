@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use regex::Regex;
@@ -93,9 +93,9 @@ pub struct ProxyState {
     /// Sessions for which we've already emitted the "Plan markdown saved to …"
     /// chat message. Prevents re-injecting the notification on every streaming chunk.
     plan_file_message_emitted: HashSet<String>,
-    /// The workspace cwd for this proxy instance, learned from the first
-    /// `session/new` request. Used to scope `session/list` to this workspace
-    /// when the client doesn't provide a `cwd` filter.
+    /// The authoritative workspace cwd for this proxy instance.
+    /// Learned from the first valid `session/new` request unless seeded
+    /// from `CURSOR_ACP_WORKSPACE_ROOT`.
     pub workspace_cwd: Option<String>,
 
     // --- Terminal synthesis for execute tool calls ---
@@ -319,6 +319,224 @@ fn parse_env_flag(raw: Option<&str>, default: bool) -> bool {
     }
 }
 
+fn allow_root_workspace() -> bool {
+    env_flag_or_default("CURSOR_ACP_ALLOW_ROOT_WORKSPACE", false)
+}
+
+fn normalize_workspace_cwd_with_options(raw: &str, allow_root: bool) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            // Reject parent traversals to keep workspace identity deterministic.
+            Component::ParentDir => return None,
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return None;
+    }
+
+    if !allow_root && normalized.parent().is_none() {
+        return None;
+    }
+
+    Some(normalized.to_string_lossy().into_owned())
+}
+
+pub fn normalize_workspace_cwd(raw: &str) -> Option<String> {
+    normalize_workspace_cwd_with_options(raw, allow_root_workspace())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = *bytes.get(i + 1)?;
+            let lo = *bytes.get(i + 2)?;
+            let value = (hex_value(hi)? << 4) | hex_value(lo)?;
+            out.push(value);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn file_uri_to_path(raw_uri: &str) -> Option<String> {
+    let after_scheme = raw_uri.strip_prefix("file://")?;
+    let slash_idx = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let raw_path = &after_scheme[slash_idx..];
+    let path = percent_decode(raw_path)?;
+
+    #[cfg(windows)]
+    {
+        // Convert `/C:/repo` style file URIs to `C:/repo`.
+        let bytes = path.as_bytes();
+        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
+            path.remove(0);
+        }
+    }
+
+    Some(path)
+}
+
+fn normalize_workspace_source(raw: &str) -> Option<String> {
+    if raw.starts_with("file://") {
+        file_uri_to_path(raw).and_then(|path| normalize_workspace_cwd(&path))
+    } else {
+        normalize_workspace_cwd(raw)
+    }
+}
+
+pub fn workspace_cwd_from_initialize(msg: &Value) -> Option<String> {
+    for pointer in ["/params/cwd", "/params/workspaceCwd", "/params/rootPath"] {
+        if let Some(raw) = msg.pointer(pointer).and_then(Value::as_str)
+            && let Some(cwd) = normalize_workspace_source(raw)
+        {
+            return Some(cwd);
+        }
+    }
+
+    if let Some(raw) = msg.pointer("/params/rootUri").and_then(Value::as_str)
+        && let Some(cwd) = normalize_workspace_source(raw)
+    {
+        return Some(cwd);
+    }
+
+    if let Some(folders) = msg
+        .pointer("/params/workspaceFolders")
+        .and_then(Value::as_array)
+    {
+        for folder in folders {
+            let raw = folder
+                .get("uri")
+                .and_then(Value::as_str)
+                .or_else(|| folder.get("path").and_then(Value::as_str))
+                .or_else(|| folder.as_str());
+            if let Some(raw) = raw
+                && let Some(cwd) = normalize_workspace_source(raw)
+            {
+                return Some(cwd);
+            }
+        }
+    }
+
+    None
+}
+
+pub fn workspace_cwd_from_env() -> Option<String> {
+    let raw = std::env::var("CURSOR_ACP_WORKSPACE_ROOT").ok()?;
+    let normalized = normalize_workspace_cwd(&raw);
+    if normalized.is_none() {
+        tracing::warn!(
+            value = raw.as_str(),
+            "ignoring invalid CURSOR_ACP_WORKSPACE_ROOT (must be absolute and not root by default)"
+        );
+    }
+    normalized
+}
+
+fn workspace_error_response(request_id: &Value, message: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32602,
+            "message": message,
+        }
+    })
+    .to_string()
+}
+
+fn handle_session_new_request(msg: &Value, state: &mut ProxyState) -> ClientAction {
+    let request_id = msg.get("id").cloned().unwrap_or(Value::Null);
+
+    let incoming_cwd = msg
+        .pointer("/params/cwd")
+        .and_then(Value::as_str)
+        .and_then(normalize_workspace_cwd);
+
+    // If stored state is somehow invalid, clear it and force re-resolution.
+    if state
+        .workspace_cwd
+        .as_deref()
+        .is_some_and(|cwd| normalize_workspace_cwd(cwd).is_none())
+    {
+        tracing::warn!("clearing invalid workspace_cwd from proxy state");
+        state.workspace_cwd = None;
+    }
+
+    let established_workspace = state
+        .workspace_cwd
+        .as_deref()
+        .and_then(normalize_workspace_cwd);
+
+    let resolved_workspace = match (established_workspace, incoming_cwd) {
+        (Some(existing), Some(incoming)) if incoming != existing => {
+            return ClientAction::Respond {
+                response_to_zed: workspace_error_response(
+                    &request_id,
+                    &format!(
+                        "session/new cwd `{incoming}` does not match established workspace `{existing}`"
+                    ),
+                ),
+                restart_with_model: None,
+            };
+        }
+        (Some(existing), _) => existing,
+        (None, Some(incoming)) => {
+            state.workspace_cwd = Some(incoming.clone());
+            incoming
+        }
+        (None, None) => {
+            return ClientAction::Respond {
+                response_to_zed: workspace_error_response(
+                    &request_id,
+                    "session/new requires an absolute workspace cwd; set params.cwd or CURSOR_ACP_WORKSPACE_ROOT",
+                ),
+                restart_with_model: None,
+            };
+        }
+    };
+
+    if let Some(id) = msg.get("id").map(|v| v.to_string()) {
+        state
+            .pending_new_session_cwds
+            .insert(id, resolved_workspace.clone());
+    }
+
+    let mut patched = msg.clone();
+    patched["params"]["cwd"] = json!(resolved_workspace);
+    ClientAction::ForwardPatched(patched.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Client → Agent direction
 // ---------------------------------------------------------------------------
@@ -359,6 +577,37 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
 
     match method {
         Some("initialize") => {
+            if state
+                .workspace_cwd
+                .as_deref()
+                .is_some_and(|cwd| normalize_workspace_cwd(cwd).is_none())
+            {
+                tracing::warn!("clearing invalid workspace_cwd from proxy state before initialize");
+                state.workspace_cwd = None;
+            }
+
+            if let Some(init_workspace) = workspace_cwd_from_initialize(msg) {
+                if let Some(existing) = state
+                    .workspace_cwd
+                    .as_deref()
+                    .and_then(normalize_workspace_cwd)
+                {
+                    if existing != init_workspace {
+                        tracing::warn!(
+                            existing = %existing,
+                            initialize = %init_workspace,
+                            "initialize workspace differs from established workspace; keeping established value"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        cwd = %init_workspace,
+                        "established workspace from initialize request"
+                    );
+                    state.workspace_cwd = Some(init_workspace);
+                }
+            }
+
             state.init_request_id = msg.get("id").cloned();
             state.stored_init_request = Some(strip_meta_from_init(msg));
             ClientAction::ForwardPatched(state.stored_init_request.clone().unwrap())
@@ -368,19 +617,7 @@ pub fn process_client_message(msg: &Value, state: &mut ProxyState) -> ClientActi
             state.stored_auth_request = Some(line.clone());
             ClientAction::ForwardPatched(line)
         }
-        Some("session/new") => {
-            let cwd = msg
-                .pointer("/params/cwd")
-                .and_then(|v| v.as_str().map(String::from));
-
-            if let (Some(id), Some(cwd)) = (msg.get("id").map(|v| v.to_string()), cwd) {
-                state.pending_new_session_cwds.insert(id, cwd.to_string());
-                if state.workspace_cwd.is_none() {
-                    state.workspace_cwd = Some(cwd);
-                }
-            }
-            ClientAction::Forward
-        }
+        Some("session/new") => handle_session_new_request(msg, state),
         Some("session/prompt") => {
             if let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str) {
                 state.zed_session_id = Some(session_id.to_string());
@@ -2279,6 +2516,14 @@ mod tests {
         }
     }
 
+    fn test_file_uri(abs_path: &str) -> String {
+        if cfg!(windows) {
+            format!("file:///{}", abs_path.replace('\\', "/"))
+        } else {
+            format!("file://{abs_path}")
+        }
+    }
+
     #[test]
     fn forward_normal_notification() {
         let mut state = ProxyState::new();
@@ -2520,6 +2765,59 @@ mod tests {
     }
 
     #[test]
+    fn initialize_establishes_workspace_from_workspace_cwd() {
+        let mut state = ProxyState::new();
+        let workspace = test_abs("/repo");
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "workspaceCwd": workspace,
+                "clientCapabilities": { "fs": { "readTextFile": true }, "terminal": true }
+            }
+        });
+
+        match process_client_message(&msg, &mut state) {
+            ClientAction::ForwardPatched(_) => {
+                assert_eq!(
+                    state.workspace_cwd.as_deref(),
+                    Some(test_abs("/repo").as_str())
+                );
+            }
+            _ => panic!("expected ForwardPatched"),
+        }
+    }
+
+    #[test]
+    fn initialize_establishes_workspace_from_root_uri() {
+        let mut state = ProxyState::new();
+        let workspace = test_abs("/repo");
+        let root_uri = test_file_uri(&workspace);
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "rootUri": root_uri,
+                "clientCapabilities": { "fs": { "readTextFile": true }, "terminal": true }
+            }
+        });
+
+        match process_client_message(&msg, &mut state) {
+            ClientAction::ForwardPatched(_) => {
+                assert_eq!(
+                    state.workspace_cwd.as_deref(),
+                    Some(test_abs("/repo").as_str())
+                );
+            }
+            _ => panic!("expected ForwardPatched"),
+        }
+    }
+
+    #[test]
     fn set_model_intercept() {
         let mut state = ProxyState::new();
         state.child_session_id = Some("child-old".to_string());
@@ -2656,6 +2954,155 @@ Tip: use --model <id> to switch.
 
         assert!(parse_env_flag(Some("unexpected"), true));
         assert!(!parse_env_flag(Some("unexpected"), false));
+    }
+
+    #[test]
+    fn normalize_workspace_cwd_rules() {
+        let abs = test_abs("/repo");
+        assert_eq!(
+            normalize_workspace_cwd_with_options(&abs, false),
+            Some(abs.clone())
+        );
+        assert_eq!(normalize_workspace_cwd_with_options("", false), None);
+        assert_eq!(
+            normalize_workspace_cwd_with_options("relative/path", false),
+            None
+        );
+        assert_eq!(
+            normalize_workspace_cwd_with_options(&test_abs("/"), false),
+            None
+        );
+        assert_eq!(
+            normalize_workspace_cwd_with_options(&test_abs("/"), true),
+            Some(test_abs("/"))
+        );
+        assert_eq!(
+            normalize_workspace_cwd_with_options(&test_abs("/repo/../other"), false),
+            None
+        );
+    }
+
+    #[test]
+    fn session_new_patches_and_sets_workspace() {
+        let mut state = ProxyState::new();
+        let cwd = test_abs("/workspace");
+        let expected = cwd.clone();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/new",
+            "params": { "cwd": cwd, "mcpServers": [] }
+        });
+
+        match process_client_message(&msg, &mut state) {
+            ClientAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                let resolved = parsed.pointer("/params/cwd").and_then(Value::as_str);
+                assert_eq!(resolved, Some(expected.as_str()));
+                assert_eq!(state.workspace_cwd.as_deref(), resolved);
+                assert_eq!(
+                    state.pending_new_session_cwds.get("7").map(String::as_str),
+                    resolved
+                );
+            }
+            _ => panic!("expected ForwardPatched"),
+        }
+    }
+
+    #[test]
+    fn session_new_rejects_missing_cwd_without_workspace() {
+        let mut state = ProxyState::new();
+        state.workspace_cwd = None;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "session/new",
+            "params": { "mcpServers": [] }
+        });
+
+        match process_client_message(&msg, &mut state) {
+            ClientAction::Respond {
+                response_to_zed,
+                restart_with_model,
+            } => {
+                assert!(restart_with_model.is_none());
+                let parsed: Value = serde_json::from_str(&response_to_zed).unwrap();
+                assert_eq!(parsed["id"], 8);
+                assert_eq!(parsed.pointer("/error/code"), Some(&json!(-32602)));
+            }
+            _ => panic!("expected Respond"),
+        }
+    }
+
+    #[test]
+    fn session_new_uses_established_workspace_when_cwd_missing() {
+        let mut state = ProxyState::new();
+        let expected = test_abs("/workspace");
+        state.workspace_cwd = Some(expected.clone());
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "session/new",
+            "params": { "mcpServers": [] }
+        });
+
+        match process_client_message(&msg, &mut state) {
+            ClientAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                assert_eq!(
+                    parsed.pointer("/params/cwd").and_then(Value::as_str),
+                    Some(expected.as_str())
+                );
+            }
+            _ => panic!("expected ForwardPatched"),
+        }
+    }
+
+    #[test]
+    fn session_new_rejects_workspace_mismatch() {
+        let mut state = ProxyState::new();
+        state.workspace_cwd = Some(test_abs("/workspace-a"));
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "session/new",
+            "params": { "cwd": test_abs("/workspace-b"), "mcpServers": [] }
+        });
+
+        match process_client_message(&msg, &mut state) {
+            ClientAction::Respond {
+                response_to_zed, ..
+            } => {
+                let parsed: Value = serde_json::from_str(&response_to_zed).unwrap();
+                assert_eq!(parsed["id"], 10);
+                assert_eq!(parsed.pointer("/error/code"), Some(&json!(-32602)));
+            }
+            _ => panic!("expected Respond"),
+        }
+    }
+
+    #[test]
+    fn session_new_reuses_workspace_when_incoming_is_root() {
+        let mut state = ProxyState::new();
+        let workspace = test_abs("/workspace");
+        state.workspace_cwd = Some(workspace.clone());
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "session/new",
+            "params": { "cwd": test_abs("/"), "mcpServers": [] }
+        });
+
+        match process_client_message(&msg, &mut state) {
+            ClientAction::ForwardPatched(patched) => {
+                let parsed: Value = serde_json::from_str(&patched).unwrap();
+                assert_eq!(
+                    parsed.pointer("/params/cwd").and_then(Value::as_str),
+                    Some(workspace.as_str())
+                );
+            }
+            _ => panic!("expected ForwardPatched"),
+        }
     }
 
     #[test]

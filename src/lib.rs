@@ -48,6 +48,10 @@ pub async fn run_main() -> Result<()> {
     {
         let mut st = state.lock().await;
         st.agent_binary = Some(binary.clone());
+        if let Some(workspace) = proxy::workspace_cwd_from_env() {
+            tracing::info!(cwd = %workspace, "using workspace from CURSOR_ACP_WORKSPACE_ROOT");
+            st.workspace_cwd = Some(workspace);
+        }
     }
 
     // Load cached models immediately so the model list is available for
@@ -73,6 +77,8 @@ pub async fn run_main() -> Result<()> {
     }
 
     let store = Arc::new(sessions::SessionStore::new().await);
+    let (history_tx, history_rx) = mpsc::unbounded_channel::<HistoryEvent>();
+    tokio::spawn(run_history_writer(Arc::clone(&store), history_rx));
 
     // Periodic flush task: persist session index every 30s if dirty.
     let flush_store = Arc::clone(&store);
@@ -91,8 +97,12 @@ pub async fn run_main() -> Result<()> {
 
     // Spawn initial child if possible. If not, we still start and let Zed prompt
     // the user to install Cursor CLI.
+    let initial_workspace_cwd = {
+        let st = state.lock().await;
+        st.workspace_cwd.clone()
+    };
     let initial_child = if binary_available {
-        match spawn_child(&binary, None, &pty_env) {
+        match spawn_child(&binary, None, &pty_env, initial_workspace_cwd.as_deref()) {
             Ok(child) => Some(child),
             Err(e) => {
                 tracing::warn!(err = %e, "failed to spawn initial agent; will run without child");
@@ -112,6 +122,7 @@ pub async fn run_main() -> Result<()> {
     let stdin_to_zed = to_zed_tx.clone();
     let stdin_child_handle = Arc::clone(&child_handle);
     let stdin_store = Arc::clone(&store);
+    let stdin_history_tx = history_tx.clone();
     let binary_for_restart = binary.clone();
     let pty_env_for_restart = pty_env.clone();
     let stdin_task = tokio::spawn(async move {
@@ -119,6 +130,10 @@ pub async fn run_main() -> Result<()> {
         let mut lines = reader.lines();
         // When model changes, we need a new channel for the new child writer.
         let mut current_to_child = to_child_tx;
+        // Tracks the workspace cwd used when spawning the current child.
+        // If the first resolved session workspace differs, we respawn once so
+        // child process cwd is aligned before creating the session.
+        let mut child_spawn_workspace_cwd = initial_workspace_cwd;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let msg: Option<Value> = serde_json::from_str(&line).ok();
@@ -180,37 +195,76 @@ pub async fn run_main() -> Result<()> {
 
                 // Replay stored history as session/update notifications.
                 let history = stdin_store.load_history(session_id).await;
+                let replay_history = normalize_history_updates_for_replay(&history);
+                let replay_workspace_cwd = {
+                    let st = stdin_state.lock().await;
+                    st.workspace_cwd.clone()
+                };
                 tracing::info!(
                     count = history.len(),
+                    replay_count = replay_history.len(),
                     session_id,
                     "replaying session history"
                 );
-                for update in &history {
-                    let notification = sessions::build_history_notification(session_id, update);
+                let replay_notifications = replay_history_for_zed(
+                    session_id,
+                    &replay_history,
+                    replay_workspace_cwd.as_deref(),
+                );
+                for notification in replay_notifications {
                     drop(stdin_to_zed.send(notification));
                 }
 
                 // Set the Zed session ID and create a fresh session in the child
                 // so subsequent prompts have a valid context.
-                let cwd = msg
+                let explicit_cwd = msg
                     .pointer("/params/cwd")
                     .and_then(Value::as_str)
-                    .map(String::from);
-                let stored_cwd = if cwd.is_none() {
+                    .and_then(proxy::normalize_workspace_cwd);
+                let stored_cwd = if explicit_cwd.is_none() {
                     stdin_store
                         .list_sessions(None)
                         .await
                         .iter()
                         .find(|s| s.id == session_id)
-                        .map(|s| s.cwd.clone())
+                        .and_then(|s| proxy::normalize_workspace_cwd(&s.cwd))
                 } else {
                     None
                 };
-                let cwd = cwd.or(stored_cwd).unwrap_or_else(|| ".".to_string());
+                let workspace_cwd = {
+                    let st = stdin_state.lock().await;
+                    st.workspace_cwd
+                        .as_deref()
+                        .and_then(proxy::normalize_workspace_cwd)
+                };
+
+                if let (Some(explicit), Some(workspace)) =
+                    (explicit_cwd.as_deref(), workspace_cwd.as_deref())
+                    && explicit != workspace
+                {
+                    let response = workspace_error_response(
+                        &request_id,
+                        &format!(
+                            "session/load cwd `{explicit}` does not match established workspace `{workspace}`"
+                        ),
+                    );
+                    drop(stdin_to_zed.send(response));
+                    continue;
+                }
+
+                let cwd = explicit_cwd.or(workspace_cwd).or(stored_cwd);
+                let Some(cwd) = cwd else {
+                    let response = workspace_error_response(
+                        &request_id,
+                        "unable to resolve workspace cwd for session/load; provide params.cwd or start a new session first",
+                    );
+                    drop(stdin_to_zed.send(response));
+                    continue;
+                };
 
                 // Also stash a condensed history blob so the next `session/prompt`
                 // includes context for the child agent after a restart.
-                let history_for_child = format_history_for_child(&history);
+                let history_for_child = format_history_for_child(&replay_history);
 
                 let (load_req_id, child_session_ready_rx) = {
                     let mut st = stdin_state.lock().await;
@@ -317,6 +371,108 @@ pub async fn run_main() -> Result<()> {
                     drop(current_to_child.send(line));
                 }
                 proxy::ClientAction::ForwardPatched(patched) => {
+                    if msg
+                        .as_ref()
+                        .and_then(|m| m.get("method"))
+                        .and_then(Value::as_str)
+                        == Some("session/new")
+                    {
+                        let desired_workspace =
+                            serde_json::from_str::<Value>(&patched).ok().and_then(|v| {
+                                v.pointer("/params/cwd")
+                                    .and_then(Value::as_str)
+                                    .and_then(proxy::normalize_workspace_cwd)
+                            });
+
+                        if let Some(desired_workspace) = desired_workspace
+                            && child_spawn_workspace_cwd.as_deref()
+                                != Some(desired_workspace.as_str())
+                        {
+                            let selected_model = {
+                                let st = stdin_state.lock().await;
+                                st.selected_model.clone()
+                            };
+
+                            match spawn_child(
+                                &binary_for_restart,
+                                selected_model.as_deref(),
+                                &pty_env_for_restart,
+                                Some(desired_workspace.as_str()),
+                            ) {
+                                Ok(new_child) => {
+                                    tracing::info!(
+                                        cwd = %desired_workspace,
+                                        "respawning child to bind workspace cwd before session/new"
+                                    );
+
+                                    {
+                                        let mut handle = stdin_child_handle.lock().await;
+                                        if let Some(child) = handle.as_mut() {
+                                            drop(child.stdin.take());
+                                            child.kill().await.ok();
+                                        }
+                                        *handle = Some(new_child);
+                                    }
+
+                                    // New channels for the new child's stdin.
+                                    let (new_tx, new_rx) = mpsc::unbounded_channel::<String>();
+                                    current_to_child = new_tx.clone();
+
+                                    // Spawn new child writer.
+                                    let new_stdin = stdin_child_handle
+                                        .lock()
+                                        .await
+                                        .as_mut()
+                                        .and_then(|c| c.stdin.take())
+                                        .unwrap();
+                                    tokio::spawn(write_to_sink(new_stdin, new_rx));
+
+                                    // Spawn new child reader.
+                                    let new_stdout = stdin_child_handle
+                                        .lock()
+                                        .await
+                                        .as_mut()
+                                        .and_then(|c| c.stdout.take())
+                                        .unwrap();
+                                    let reader_to_zed = stdin_to_zed.clone();
+                                    let reader_to_child = new_tx;
+                                    let reader_state = Arc::clone(&stdin_state);
+                                    let reader_history_tx = stdin_history_tx.clone();
+                                    tokio::spawn(read_child_stdout(
+                                        new_stdout,
+                                        reader_to_zed,
+                                        reader_to_child,
+                                        reader_state,
+                                        reader_history_tx,
+                                    ));
+
+                                    {
+                                        let mut st = stdin_state.lock().await;
+                                        st.child_session_id = None;
+                                    }
+
+                                    // Replay init + auth so the new child is ready for the
+                                    // session/new request we'll send immediately after.
+                                    let replay_msgs = {
+                                        let mut st = stdin_state.lock().await;
+                                        st.prepare_replay_messages()
+                                    };
+                                    for msg in replay_msgs {
+                                        drop(current_to_child.send(msg));
+                                    }
+
+                                    child_spawn_workspace_cwd = Some(desired_workspace);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        err = %e,
+                                        "failed to respawn child for workspace binding; continuing with current child"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     drop(current_to_child.send(patched));
                 }
                 proxy::ClientAction::ForwardWithPrompt {
@@ -332,19 +488,41 @@ pub async fn run_main() -> Result<()> {
                         (pending, sid)
                     };
                     if let Some(sid) = zed_sid {
-                        let s = Arc::clone(&stdin_store);
-                        tokio::spawn(async move {
-                            if let Some((id, cwd)) = pending {
-                                tracing::debug!(session_id = %id, cwd = %cwd, "creating session on first prompt");
-                                s.create_session(&id, &cwd).await;
+                        if let Some((id, cwd)) = pending {
+                            tracing::debug!(session_id = %id, cwd = %cwd, "creating session on first prompt");
+                            if stdin_history_tx
+                                .send(HistoryEvent::CreateSession { id, cwd })
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "history writer unavailable while creating pending session"
+                                );
                             }
-                            let user_update = serde_json::json!({
-                                "sessionUpdate": "user_message_chunk",
-                                "content": { "type": "text", "text": prompt_text }
-                            });
-                            s.append_history(&sid, &user_update).await;
-                            s.set_title_if_empty(&sid, &prompt_text).await;
+                        }
+                        let user_update = serde_json::json!({
+                            "sessionUpdate": "user_message_chunk",
+                            "content": { "type": "text", "text": prompt_text }
                         });
+                        if stdin_history_tx
+                            .send(HistoryEvent::AppendHistory {
+                                session_id: sid.clone(),
+                                update: user_update,
+                            })
+                            .is_err()
+                        {
+                            tracing::warn!(session_id = %sid, "history writer unavailable while appending prompt");
+                        }
+                        if stdin_history_tx
+                            .send(HistoryEvent::SetTitleIfEmpty {
+                                session_id: sid,
+                                text: prompt_text,
+                            })
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "history writer unavailable while setting session title"
+                            );
+                        }
                     }
                 }
                 proxy::ClientAction::Drop => {
@@ -368,8 +546,18 @@ pub async fn run_main() -> Result<()> {
                             }
                         }
 
+                        let restart_workspace_cwd = {
+                            let st = stdin_state.lock().await;
+                            st.workspace_cwd.clone()
+                        };
+
                         // Spawn new child.
-                        match spawn_child(&binary_for_restart, Some(&model), &pty_env_for_restart) {
+                        match spawn_child(
+                            &binary_for_restart,
+                            Some(&model),
+                            &pty_env_for_restart,
+                            restart_workspace_cwd.as_deref(),
+                        ) {
                             Ok(new_child) => {
                                 *stdin_child_handle.lock().await = Some(new_child);
 
@@ -396,13 +584,13 @@ pub async fn run_main() -> Result<()> {
                                 let reader_to_zed = stdin_to_zed.clone();
                                 let reader_to_child = new_tx;
                                 let reader_state = Arc::clone(&stdin_state);
-                                let reader_store = Arc::clone(&stdin_store);
+                                let reader_history_tx = stdin_history_tx.clone();
                                 tokio::spawn(read_child_stdout(
                                     new_stdout,
                                     reader_to_zed,
                                     reader_to_child,
                                     reader_state,
-                                    reader_store,
+                                    reader_history_tx,
                                 ));
 
                                 // Replay init + auth with unique IDs (responses suppressed).
@@ -413,30 +601,44 @@ pub async fn run_main() -> Result<()> {
                                 for msg in replay_msgs {
                                     drop(current_to_child.send(msg));
                                 }
+                                child_spawn_workspace_cwd = restart_workspace_cwd.clone();
 
                                 // Recreate a child session after restart so subsequent
                                 // session-scoped requests (e.g., session/prompt) have
                                 // a valid context. Zed keeps using its existing session
                                 // ID; we remap it to the new child session ID.
-                                let (zed_sid, pending_cwd) = {
+                                let (zed_sid, pending_cwd, workspace_cwd) = {
                                     let st = stdin_state.lock().await;
                                     let sid = st.zed_session_id.clone();
                                     let cwd = sid
                                         .as_ref()
-                                        .and_then(|s| st.pending_sessions.get(s).cloned());
-                                    (sid, cwd)
+                                        .and_then(|s| st.pending_sessions.get(s).cloned())
+                                        .and_then(|cwd| proxy::normalize_workspace_cwd(&cwd));
+                                    let workspace = st
+                                        .workspace_cwd
+                                        .as_deref()
+                                        .and_then(proxy::normalize_workspace_cwd);
+                                    (sid, cwd, workspace)
                                 };
                                 if let Some(zed_sid) = zed_sid {
-                                    let cwd = if let Some(cwd) = pending_cwd {
-                                        cwd
-                                    } else {
+                                    let stored_cwd = if pending_cwd.is_none() {
                                         stdin_store
                                             .list_sessions(None)
                                             .await
                                             .into_iter()
                                             .find(|s| s.id == zed_sid)
-                                            .map(|s| s.cwd)
-                                            .unwrap_or_else(|| ".".to_string())
+                                            .and_then(|s| proxy::normalize_workspace_cwd(&s.cwd))
+                                    } else {
+                                        None
+                                    };
+                                    let cwd = workspace_cwd.or(pending_cwd).or(stored_cwd);
+
+                                    let Some(cwd) = cwd else {
+                                        tracing::warn!(
+                                            session_id = %zed_sid,
+                                            "skipping session/new after model restart: workspace cwd unresolved"
+                                        );
+                                        continue;
                                     };
 
                                     let req_id = {
@@ -487,7 +689,7 @@ pub async fn run_main() -> Result<()> {
             to_zed_tx,
             to_child_for_intercept,
             Arc::clone(&state),
-            Arc::clone(&store),
+            history_tx,
         ));
     } else {
         // Drop receiver so any sends fail fast (we guard on child existence anyway).
@@ -593,7 +795,11 @@ fn cursor_agent_versions_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
-        return Some(PathBuf::from(local_app_data).join("cursor-agent").join("versions"));
+        return Some(
+            PathBuf::from(local_app_data)
+                .join("cursor-agent")
+                .join("versions"),
+        );
     }
     #[cfg(not(windows))]
     {
@@ -703,6 +909,18 @@ fn bootstrap_error_response(request_id: &Value, message: &str) -> String {
     resp.to_string()
 }
 
+fn workspace_error_response(request_id: &Value, message: &str) -> String {
+    let resp = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32602,
+            "message": message
+        }
+    });
+    resp.to_string()
+}
+
 fn which_exists(name: &str) -> bool {
     #[cfg(windows)]
     {
@@ -804,12 +1022,17 @@ fn spawn_child(
     binary: &str,
     model: Option<&str>,
     pty_env: &Option<PtyStreamingEnv>,
+    workspace_cwd: Option<&str>,
 ) -> Result<Child> {
     let mut cmd = build_command(binary);
     cmd.arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+
+    if let Some(cwd) = workspace_cwd {
+        cmd.current_dir(cwd);
+    }
 
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
@@ -907,7 +1130,7 @@ async fn read_child_stdout(
     to_zed: mpsc::UnboundedSender<String>,
     to_child: mpsc::UnboundedSender<String>,
     state: Arc<Mutex<proxy::ProxyState>>,
-    store: Arc<sessions::SessionStore>,
+    history_tx: mpsc::UnboundedSender<HistoryEvent>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -936,15 +1159,33 @@ async fn read_child_stdout(
                     info.session_id = zed_sid.clone();
                 }
             }
-            let s = Arc::clone(&store);
-            tokio::spawn(async move {
-                s.append_history(&info.session_id, &info.update).await;
-                if let Some(t) = info.title {
-                    s.update_title(&info.session_id, &t).await;
-                } else if let Some(text) = info.user_message {
-                    s.set_title_if_empty(&info.session_id, &text).await;
+            let session_id = info.session_id;
+            if history_tx
+                .send(HistoryEvent::AppendHistory {
+                    session_id: session_id.clone(),
+                    update: info.update,
+                })
+                .is_err()
+            {
+                tracing::warn!(session_id = %session_id, "history writer unavailable while appending session update");
+            }
+            if let Some(t) = info.title {
+                if history_tx
+                    .send(HistoryEvent::UpdateTitle {
+                        session_id: session_id.clone(),
+                        title: t,
+                    })
+                    .is_err()
+                {
+                    tracing::warn!(session_id = %session_id, "history writer unavailable while updating title");
                 }
-            });
+            } else if let Some(text) = info.user_message
+                && history_tx
+                    .send(HistoryEvent::SetTitleIfEmpty { session_id, text })
+                    .is_err()
+            {
+                tracing::warn!("history writer unavailable while setting title from user message");
+            }
         }
 
         let action = {
@@ -994,6 +1235,36 @@ async fn read_child_stdout(
         }
     }
     tracing::debug!("child stdout EOF");
+}
+
+enum HistoryEvent {
+    CreateSession { id: String, cwd: String },
+    AppendHistory { session_id: String, update: Value },
+    UpdateTitle { session_id: String, title: String },
+    SetTitleIfEmpty { session_id: String, text: String },
+}
+
+async fn run_history_writer(
+    store: Arc<sessions::SessionStore>,
+    mut history_rx: mpsc::UnboundedReceiver<HistoryEvent>,
+) {
+    while let Some(event) = history_rx.recv().await {
+        match event {
+            HistoryEvent::CreateSession { id, cwd } => {
+                store.create_session(&id, &cwd).await;
+            }
+            HistoryEvent::AppendHistory { session_id, update } => {
+                store.append_history(&session_id, &update).await;
+            }
+            HistoryEvent::UpdateTitle { session_id, title } => {
+                store.update_title(&session_id, &title).await;
+            }
+            HistoryEvent::SetTitleIfEmpty { session_id, text } => {
+                store.set_title_if_empty(&session_id, &text).await;
+            }
+        }
+    }
+    tracing::debug!("history writer channel closed");
 }
 
 async fn write_to_sink(
@@ -1271,6 +1542,7 @@ fn format_history_for_child(history: &[Value]) -> String {
 
     let mut out = String::new();
     let mut tool_info: HashMap<String, ToolInfo> = HashMap::new();
+    let normalized_history = normalize_history_updates_for_replay(history);
 
     #[derive(PartialEq)]
     enum Speaker {
@@ -1281,7 +1553,7 @@ fn format_history_for_child(history: &[Value]) -> String {
     }
     let mut last_speaker = Speaker::None;
 
-    for update in history {
+    for update in &normalized_history {
         let update_type = match update.get("sessionUpdate").and_then(Value::as_str) {
             Some(t) => t,
             None => continue,
@@ -1291,23 +1563,30 @@ fn format_history_for_child(history: &[Value]) -> String {
             "user_message_chunk" => {
                 if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
                     if last_speaker == Speaker::Assistant || last_speaker == Speaker::Tool {
-                        out.push_str("\n---\n\n");
-                    }
-                    if last_speaker != Speaker::User {
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str("---\n\n");
+                        out.push_str("User: ");
+                    } else if last_speaker != Speaker::User {
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
                         out.push_str("User: ");
                     }
                     out.push_str(text);
-                    out.push('\n');
                     last_speaker = Speaker::User;
                 }
             }
             "agent_message_chunk" | "assistant_message_chunk" => {
                 if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
                     if last_speaker != Speaker::Assistant {
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
                         out.push_str("Assistant: ");
                     }
                     out.push_str(text);
-                    out.push('\n');
                     last_speaker = Speaker::Assistant;
                 }
             }
@@ -1373,6 +1652,9 @@ fn format_history_for_child(history: &[Value]) -> String {
                 }
 
                 summary.push(']');
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
                 out.push_str(&summary);
                 out.push('\n');
                 last_speaker = Speaker::Tool;
@@ -1397,11 +1679,344 @@ fn format_history_for_child(history: &[Value]) -> String {
     )
 }
 
+fn normalize_history_updates_for_replay(history: &[Value]) -> Vec<Value> {
+    let mut normalized = Vec::with_capacity(history.len());
+    let mut pending_kind: Option<String> = None;
+    let mut pending_text = String::new();
+
+    for update in history {
+        let update_type = update.get("sessionUpdate").and_then(Value::as_str);
+        let text = update.pointer("/content/text").and_then(Value::as_str);
+        let is_text_chunk = matches!(
+            update_type,
+            Some("user_message_chunk")
+                | Some("agent_message_chunk")
+                | Some("assistant_message_chunk")
+        ) && update.pointer("/content/type").and_then(Value::as_str)
+            == Some("text")
+            && text.is_some();
+
+        if is_text_chunk {
+            let kind = update_type.unwrap_or_default();
+            if pending_kind.as_deref() == Some(kind) {
+                pending_text.push_str(text.unwrap_or_default());
+            } else {
+                flush_pending_history_text(&mut normalized, &mut pending_kind, &mut pending_text);
+                pending_kind = Some(kind.to_string());
+                pending_text.push_str(text.unwrap_or_default());
+            }
+            continue;
+        }
+
+        flush_pending_history_text(&mut normalized, &mut pending_kind, &mut pending_text);
+        normalized.push(update.clone());
+    }
+
+    flush_pending_history_text(&mut normalized, &mut pending_kind, &mut pending_text);
+    normalized
+}
+
+/// Convert stored session history updates into notifications suitable for replay in Zed.
+///
+/// We keep history persisted as raw updates from the child, but during replay we run each
+/// update through the same proxy interception pipeline used live (notably execute/terminal
+/// synthesis) so the replayed UI matches what the user saw originally.
+fn replay_history_for_zed(
+    session_id: &str,
+    updates: &[Value],
+    workspace_cwd: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(updates.len());
+
+    // Use a replay-local state so replay doesn't depend on or mutate the live proxy state.
+    // In particular, we keep streaming flags empty so completed execute tool calls inject
+    // their final output snapshot for replay.
+    let mut replay_state = proxy::ProxyState::new();
+    replay_state.zed_session_id = Some(session_id.to_string());
+    replay_state.workspace_cwd = workspace_cwd.map(|s| s.to_string());
+
+    for update in updates {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": update.clone(),
+            }
+        });
+
+        match proxy::process_agent_message(&notification, &mut replay_state) {
+            proxy::AgentAction::Forward => out.push(notification.to_string()),
+            proxy::AgentAction::ForwardPatched(patched) => out.push(patched),
+            proxy::AgentAction::ForwardWithExtra {
+                line,
+                extra_notifications,
+            } => {
+                out.push(line);
+                out.extend(extra_notifications);
+            }
+            proxy::AgentAction::Intercept {
+                response_to_child: _,
+                notifications_to_zed,
+            } => {
+                out.extend(notifications_to_zed);
+            }
+            proxy::AgentAction::SpawnStreaming { line, .. } => {
+                // Replays are display-only; do not spawn subprocesses.
+                out.push(line);
+            }
+            proxy::AgentAction::Drop => {}
+        }
+    }
+
+    out
+}
+
+fn flush_pending_history_text(
+    out: &mut Vec<Value>,
+    pending_kind: &mut Option<String>,
+    pending_text: &mut String,
+) {
+    if let Some(kind) = pending_kind.take() {
+        out.push(serde_json::json!({
+            "sessionUpdate": kind,
+            "content": {
+                "type": "text",
+                "text": pending_text.clone(),
+            }
+        }));
+        pending_text.clear();
+    }
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
         let end = s.floor_char_boundary(max.min(s.len()));
         format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_history_updates_merges_text_chunks() {
+        let history = vec![
+            json!({
+                "sessionUpdate": "assistant_message_chunk",
+                "content": { "type": "text", "text": "You " }
+            }),
+            json!({
+                "sessionUpdate": "assistant_message_chunk",
+                "content": { "type": "text", "text": "were " }
+            }),
+            json!({
+                "sessionUpdate": "assistant_message_chunk",
+                "content": { "type": "text", "text": "right." }
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "abc",
+                "kind": "other",
+                "title": "noop"
+            }),
+            json!({
+                "sessionUpdate": "assistant_message_chunk",
+                "content": { "type": "text", "text": "Done." }
+            }),
+        ];
+
+        let normalized = normalize_history_updates_for_replay(&history);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0]["sessionUpdate"], "assistant_message_chunk");
+        assert_eq!(normalized[0]["content"]["text"], "You were right.");
+        assert_eq!(normalized[1]["sessionUpdate"], "tool_call");
+        assert_eq!(normalized[2]["content"]["text"], "Done.");
+    }
+
+    #[test]
+    fn format_history_for_child_keeps_streamed_text_contiguous() {
+        let history = vec![
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "lets " }
+            }),
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "go" }
+            }),
+            json!({
+                "sessionUpdate": "assistant_message_chunk",
+                "content": { "type": "text", "text": "You " }
+            }),
+            json!({
+                "sessionUpdate": "assistant_message_chunk",
+                "content": { "type": "text", "text": "were " }
+            }),
+            json!({
+                "sessionUpdate": "assistant_message_chunk",
+                "content": { "type": "text", "text": "right." }
+            }),
+        ];
+
+        let formatted = format_history_for_child(&history);
+        assert!(formatted.contains("User: lets go"));
+        assert!(formatted.contains("Assistant: You were right."));
+        assert!(!formatted.contains("You \nwere \nright."));
+    }
+
+    #[tokio::test]
+    async fn history_writer_persists_events_in_fifo_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(sessions::SessionStore::with_dir(dir.path().to_path_buf()).await);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(run_history_writer(Arc::clone(&store), rx));
+
+        tx.send(HistoryEvent::CreateSession {
+            id: "s1".to_string(),
+            cwd: "/tmp".to_string(),
+        })
+        .expect("send create");
+        tx.send(HistoryEvent::AppendHistory {
+            session_id: "s1".to_string(),
+            update: json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "A" }
+            }),
+        })
+        .expect("send A");
+        tx.send(HistoryEvent::AppendHistory {
+            session_id: "s1".to_string(),
+            update: json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "B" }
+            }),
+        })
+        .expect("send B");
+        tx.send(HistoryEvent::AppendHistory {
+            session_id: "s1".to_string(),
+            update: json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "C" }
+            }),
+        })
+        .expect("send C");
+        drop(tx);
+        writer.await.expect("writer task");
+
+        let history = store.load_history("s1").await;
+        let observed: Vec<String> = history
+            .iter()
+            .map(|u| {
+                u.pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(observed, vec!["A", "B", "C"]);
+    }
+
+    #[tokio::test]
+    async fn history_writer_preserves_fragment_order_for_regression_phrase() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(sessions::SessionStore::with_dir(dir.path().to_path_buf()).await);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(run_history_writer(Arc::clone(&store), rx));
+
+        tx.send(HistoryEvent::CreateSession {
+            id: "s2".to_string(),
+            cwd: "/tmp".to_string(),
+        })
+        .expect("send create");
+        let fragments = vec![
+            "-",
+            " I",
+            " added",
+            " regression",
+            " tests",
+            " for",
+            "-mer",
+            "ging",
+            " and",
+            " both",
+            " non",
+            " chunk",
+            "-gar",
+            "bled",
+            " formatting",
+            ".",
+        ];
+        for fragment in fragments {
+            tx.send(HistoryEvent::AppendHistory {
+                session_id: "s2".to_string(),
+                update: json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": fragment }
+                }),
+            })
+            .expect("send fragment");
+        }
+        drop(tx);
+        writer.await.expect("writer task");
+
+        let history = store.load_history("s2").await;
+        let normalized = normalize_history_updates_for_replay(&history);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            normalized[0]["content"]["text"],
+            "- I added regression tests for-merging and both non chunk-garbled formatting."
+        );
+    }
+
+    #[test]
+    fn replay_synthesizes_terminal_for_execute_tool_calls() {
+        let updates = vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "`echo hello`",
+                "kind": "execute",
+                "rawInput": {
+                    "command": "echo hello",
+                    "cwd": "/tmp"
+                }
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "completed",
+                "rawOutput": {
+                    "exitCode": 0,
+                    "stdout": "hello\n",
+                    "stderr": ""
+                }
+            }),
+        ];
+
+        let notifications = replay_history_for_zed("sess-1", &updates, Some("/tmp"));
+        assert_eq!(notifications.len(), 2);
+
+        let n1: Value = serde_json::from_str(&notifications[0]).expect("parse replay notif 1");
+        let u1 = &n1["params"]["update"];
+        assert_eq!(u1["sessionUpdate"], "tool_call");
+        assert_eq!(u1["kind"], "execute");
+        assert_eq!(u1["title"], "echo hello"); // backticks removed by synthesis
+        assert_eq!(u1["content"][0]["type"], "terminal");
+        let terminal_id = u1["_meta"]["terminal_info"]["terminal_id"]
+            .as_str()
+            .expect("terminal id");
+
+        let n2: Value = serde_json::from_str(&notifications[1]).expect("parse replay notif 2");
+        let u2 = &n2["params"]["update"];
+        assert_eq!(u2["sessionUpdate"], "tool_call_update");
+        assert_eq!(u2["_meta"]["terminal_output"]["terminal_id"], terminal_id);
+        assert_eq!(u2["_meta"]["terminal_output"]["data"], "hello\n");
+        assert_eq!(u2["_meta"]["terminal_exit"]["terminal_id"], terminal_id);
+        assert_eq!(u2["_meta"]["terminal_exit"]["exit_code"], 0);
     }
 }
