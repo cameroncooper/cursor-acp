@@ -393,6 +393,9 @@ fn file_uri_to_path(raw_uri: &str) -> Option<String> {
     let after_scheme = raw_uri.strip_prefix("file://")?;
     let slash_idx = after_scheme.find('/').unwrap_or(after_scheme.len());
     let raw_path = &after_scheme[slash_idx..];
+    #[cfg(windows)]
+    let mut path = percent_decode(raw_path)?;
+    #[cfg(not(windows))]
     let path = percent_decode(raw_path)?;
 
     #[cfg(windows)]
