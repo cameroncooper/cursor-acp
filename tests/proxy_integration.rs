@@ -156,17 +156,24 @@ fn proxy_forwards_normal_messages_and_intercepts_todos() {
 
     let messages = run_proxy_with_fake_agent(&script, &input);
 
-    let has_response: Vec<bool> = messages.iter().map(|m| m.get("result").is_some()).collect();
+    // Responses/notifications can interleave; match by id.
+    let init = messages
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_u64) == Some(1) && m.get("result").is_some())
+        .expect("initialize response forwarded");
+    assert!(init.get("result").is_some());
 
-    // 1. Initialize response forwarded
-    assert!(has_response[0], "initialize response");
+    let auth = messages
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_u64) == Some(2) && m.get("result").is_some())
+        .expect("authenticate response forwarded");
+    assert!(auth.get("result").is_some());
 
-    // 2. Authenticate response forwarded
-    assert!(has_response[1], "authenticate response");
-
-    // 3. session/new response forwarded
-    let session_result = &messages[2]["result"];
-    assert_eq!(session_result["sessionId"], "test-sess-1");
+    let session_new = messages
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_u64) == Some(3) && m.get("result").is_some())
+        .expect("session/new response forwarded");
+    assert_eq!(session_new["result"]["sessionId"], "test-sess-1");
 
     // Find the Plan notification (synthesized from _cursor/update_todos)
     let plan_msgs: Vec<&Value> = messages
